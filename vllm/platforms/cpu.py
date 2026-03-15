@@ -78,10 +78,14 @@ class CpuPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
     ) -> str:
-        if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
+        if selected_backend and selected_backend not in (
+            AttentionBackendEnum.CPU_ATTN,
+            AttentionBackendEnum.CPU_MLA,
+        ):
             logger.info("Cannot use %s backend on CPU.", selected_backend)
         if attn_selector_config.use_mla:
-            raise NotImplementedError("MLA is not supported on CPU.")
+            logger.info("Using CPU MLA backend for DeepSeek V2.")
+            return AttentionBackendEnum.CPU_MLA.get_path()
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on CPU.")
         return AttentionBackendEnum.CPU_ATTN.get_path()

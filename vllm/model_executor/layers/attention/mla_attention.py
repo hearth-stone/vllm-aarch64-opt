@@ -1899,7 +1899,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 chunk_seq_lens = (chunk_ends - chunk_starts).clamp(min=0)
 
                 cu_seq_lens_cpu = torch.zeros(
-                    num_chunks, num_prefills + 1, dtype=torch.int32, pin_memory=True
+                    num_chunks,
+                    num_prefills + 1,
+                    dtype=torch.int32,
+                    pin_memory=torch.cuda.is_available(),
                 )
                 torch.cumsum(
                     chunk_seq_lens, dim=1, out=cu_seq_lens_cpu[:, 1:], dtype=torch.int32
