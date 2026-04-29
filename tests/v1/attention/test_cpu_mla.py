@@ -543,6 +543,13 @@ def cpu_device():
 @pytest.fixture(scope="module")
 def vllm_config_cpu():
     """创建用于 CPU MLA 测试的 VllmConfig。"""
+    # 确保平台检测为 CPU，避免在无 GPU 环境下 DeviceConfig() 失败
+    import vllm.platforms as _platforms
+    if not hasattr(_platforms.current_platform, "device_type") \
+            or _platforms.current_platform.device_type != "cpu":
+        from vllm.platforms.cpu import CpuPlatform
+        _platforms.current_platform = CpuPlatform()
+
     cfg = create_vllm_config(
         model_name="deepseek-ai/DeepSeek-R1",
         tensor_parallel_size=1,

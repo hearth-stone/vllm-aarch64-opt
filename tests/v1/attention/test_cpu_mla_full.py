@@ -776,6 +776,12 @@ def cpu_device():
 @pytest.fixture(scope="module")
 def vllm_config_fixture():
     """创建用于完整 MLA 测试的 VllmConfig。"""
+    import vllm.platforms as _platforms
+    if not hasattr(_platforms.current_platform, "device_type") \
+            or _platforms.current_platform.device_type != "cpu":
+        from vllm.platforms.cpu import CpuPlatform
+        _platforms.current_platform = CpuPlatform()
+
     cfg = create_vllm_config(
         model_name="deepseek-ai/DeepSeek-R1",
         tensor_parallel_size=1,
@@ -860,6 +866,12 @@ def test_full_mla_cosine_similarity(
 
 def _run_report(args: argparse.Namespace) -> int:
     """独立运行时输出详细的余弦相似度报告。"""
+    import vllm.platforms as _platforms
+    if not hasattr(_platforms.current_platform, "device_type") \
+            or _platforms.current_platform.device_type != "cpu":
+        from vllm.platforms.cpu import CpuPlatform
+        _platforms.current_platform = CpuPlatform()
+
     device = torch.device("cpu")
     dtypes = [torch.float32, torch.bfloat16] if not args.fp32_only else [torch.float32]
     cases = list(TEST_CASES.keys()) if not args.case else [args.case]

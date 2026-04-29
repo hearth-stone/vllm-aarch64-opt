@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU MLA (Multi-head Latent Attention) 后端实现。
@@ -12,15 +11,20 @@ MLA 核心思路：
 - Decode（MQA）：将 q_nope 通过 W_UK_T 投影到潜在空间，直接与 kv_c 做 MQA 注意力，
   再将输出通过 W_UV 上投影回 v_head_dim 空间
 """
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonDecodeMetadata,
@@ -32,8 +36,6 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     AttentionType,
 )
-
-logger = init_logger(__name__)
 
 
 class CPUMLABackend(MLACommonBackend):
@@ -210,6 +212,62 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         # CPU 不需要 pad v（SDPA 支持不同的 q/v head dim）
         self._pad_v = False
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        """覆盖父类方法，在权重被清空前提取 kv_b_proj 权重构建 W_UK_T 和 W_UV。
+
+        CPU 路径下，dispatch_cpu_unquantized_gemm 可能将 kv_b_proj.weight 打包进
+        cpu_linear 并将 layer.weight 替换为空 tensor（例如 sgl kernel 路径）。
+        由于 quant_method.process_weights_after_loading 在本方法之前执行，
+        此时 kv_b_proj.weight 可能已是 torch.empty(0)。
+
+        因此本方法完全覆盖父类 MLACommonImpl.process_weights_after_loading，
+        不调用 super()，避免父类通过 get_and_maybe_dequant_weights 再次读取
+        已被清空的 weight 导致 AssertionError。
+        """
+        kv_b_weight = self.kv_b_proj.weight
+        if kv_b_weight.numel() == 0:
+            # weight 已被清空，通过 cpu_linear 使用单位矩阵探测恢复原始权重
+            eye = torch.eye(
+                self.kv_lora_rank,
+                dtype=act_dtype,
+                device=kv_b_weight.device,
+            )
+            kv_b_proj_weight = self.kv_b_proj.quant_method.apply(
+                self.kv_b_proj, eye, bias=None
+            ).to(act_dtype)
+        else:
+            kv_b_proj_weight = kv_b_weight.to(act_dtype).T
+
+        assert kv_b_proj_weight.shape == (
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+        ), (
+            f"{kv_b_proj_weight.shape=}, "
+            f"{self.kv_lora_rank=}, "
+            f"{self.num_heads=}, "
+            f"{self.qk_nope_head_dim=}, "
+            f"{self.v_head_dim=}"
+        )
+
+        kv_b_proj_weight = kv_b_proj_weight.view(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+        w_uk, w_uv = kv_b_proj_weight.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        # W_UK_T: [num_heads, qk_nope_head_dim, kv_lora_rank]
+        self.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
+        # W_UV: [num_heads, kv_lora_rank, v_head_dim]
+        self.W_UV = w_uv.transpose(0, 1).contiguous()
+
+        logger.debug(
+            "process_weights_after_loading: W_UK_T=%s, W_UV=%s",
+            tuple(self.W_UK_T.shape),
+            tuple(self.W_UV.shape),
+        )
+
     def _flash_attn_varlen_diff_headdims(
         self,
         q: torch.Tensor,
@@ -367,7 +425,8 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         v: torch.Tensor,
     ):
         """CPU Prefill 上下文 chunk 的注意力计算（非因果注意力）。"""
-        assert prefill.chunked_context is not None
+        if prefill.chunked_context is None:
+            raise AssertionError("prefill.chunked_context is None")
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
@@ -446,7 +505,10 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         """
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
-        assert prefill_metadata.chunked_context is not None
+        if prefill_metadata.chunked_context is None:
+            raise AssertionError(
+                "prefill_metadata.chunked_context is None"
+            )
 
         block_size = kv_c_and_k_pe_cache.shape[1]
         block_table = prefill_metadata.block_table  # [num_prefills, max_blocks]
@@ -501,7 +563,7 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         k_pe_ctx = gathered_kv[:, self.kv_lora_rank :].unsqueeze(1)
 
         # 通过 kv_b_proj 上投影
-        kv_nope = self.kv_b_proj(kv_c_ctx)[0].view(
+        kv_nope = self._linear(self.kv_b_proj, kv_c_ctx).view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope_ctx, v_ctx = kv_nope.split(
@@ -552,15 +614,15 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
             k_scale: KV cache 缩放因子
             output: 输出张量，shape = [num_prefill_tokens, num_heads * v_head_dim]
         """
-        assert attn_metadata.prefill is not None
-        assert self.dcp_world_size != -1
+        if attn_metadata.prefill is None:
+            raise AssertionError("attn_metadata.prefill is None")
 
         prefill_metadata = attn_metadata.prefill
         has_context = prefill_metadata.chunked_context is not None
 
         # 通过 kv_b_proj 将压缩的 kv_c 上投影为完整的 k_nope 和 v
         # kv_nope: [num_tokens, num_heads, qk_nope_head_dim + v_head_dim]
-        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+        kv_nope = self._linear(self.kv_b_proj, kv_c_normed).view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -604,7 +666,7 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: CPUMLAMetadata,
-        layer: AttentionLayer,
+        layer: AttentionLayer | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Decode 阶段的 MQA 前向计算（"absorption" 技巧）。
 
@@ -626,13 +688,15 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
             kv_c_and_k_pe_cache: KV cache，shape = [num_blocks, block_size, head_size]
                其中 head_size = kv_lora_rank + qk_rope_head_dim
             attn_metadata: 注意力元数据
-            layer: 注意力层对象
+            layer: 注意力层对象（可选）
 
         Returns:
             (output, lse): output shape = [B, N, kv_lora_rank]，lse = None
         """
-        assert kv_c_and_k_pe_cache.numel() > 0
-        assert attn_metadata.decode is not None
+        if kv_c_and_k_pe_cache.numel() <= 0:
+            raise AssertionError("kv_c_and_k_pe_cache is empty")
+        if attn_metadata.decode is None:
+            raise AssertionError("attn_metadata.decode is None")
 
         decode_metadata = attn_metadata.decode
 
@@ -746,3 +810,63 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
             gathered[start : start + remainder] = kv_cache[block_num, :remainder]
 
         return gathered
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+    ) -> None:
+        """覆盖父类方法，使用纯 PyTorch 实现替代 CUDA 算子 concat_and_cache_mla。"""
+        if kv_cache.numel() == 0:
+            return
+        self._write_kv_cache_cpu(
+            kv_c_normed,
+            k_pe.squeeze(1),
+            kv_cache,
+            slot_mapping.flatten(),
+        )
+
+    @staticmethod
+    def _write_kv_cache_cpu(
+        kv_c: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """将 kv_c 和 k_pe 拼接后按 slot_mapping 写入分页 KV cache。
+
+        CPU 纯 PyTorch 实现，替代 ops.concat_and_cache_mla。
+
+        Args:
+            kv_c: shape = [num_tokens, kv_lora_rank]
+            k_pe: shape = [num_tokens, qk_rope_head_dim]
+            kv_cache: shape = [num_blocks, block_size, head_size]
+            slot_mapping: shape = [num_tokens]，每个 token 对应的 flat slot 索引
+        """
+        kv_combined = torch.cat([kv_c, k_pe], dim=-1)
+        block_size = kv_cache.shape[1]
+        for i in range(slot_mapping.shape[0]):
+            slot = int(slot_mapping[i].item())
+            if slot < 0:
+                continue
+            kv_cache[slot // block_size, slot % block_size] = kv_combined[i]
+
+    @staticmethod
+    def _linear(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """直接调用 cpu_linear，绕过 Linear 层的 dispatch 机制。
+
+        CPU 上 process_weights_after_loading 会将权重打包进 cpu_linear lambda，
+        并将 layer.weight 替换为空 tensor，因此必须通过 cpu_linear 调用。
+
+        :param layer: Linear 层（含 cpu_linear 属性）
+        :param x: 输入张量
+        :return: 线性变换输出
+        """
+        bias = getattr(layer, "bias", None)
+        if getattr(layer, "skip_bias_add", False):
+            bias = None
+        return layer.cpu_linear(x, layer.weight, bias)
