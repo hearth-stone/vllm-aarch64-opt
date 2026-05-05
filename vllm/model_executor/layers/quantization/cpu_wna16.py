@@ -107,6 +107,12 @@ class CPUAWQConfig(QuantizationConfig):
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
         quant_method = hf_quant_cfg.get("quant_method", "").lower()
+        # 当 VLLM_CPU_AWQ_USE_FUSED_CPP=1 时，不劫持 AWQ 到 cpu_awq/cpu_wna16
+        # 路径（该路径依赖仅 x86 AVX512 编译的 cpu_gemm_wna16），保持 awq 原名，
+        # 由标准 AWQConfig + AWQLinearMethod 接管，进而走 fused_cpp.w4a8_linear。
+        # 这是 AArch64 CPU + AWQ 的唯一可用入口。
+        if envs.VLLM_CPU_AWQ_USE_FUSED_CPP:
+            return None
         if current_platform.is_cpu() and (quant_method == "awq"):
             return cls.get_name()
         return None

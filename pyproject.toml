@@ -110,6 +110,7 @@ markers = [
     "split: run this test as part of a split",
     "distributed: run this test only in distributed GPU tests",
     "optional: optional tests that are automatically skipped, include --optional to run them",
+    "bench: micro-benchmark tests, run via pytest -m bench (do not block normal CI)",
 ]
 
 [tool.ty.src]

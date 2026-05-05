@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU MLA (Multi-head Latent Attention) 后端的单元测试。
@@ -70,12 +69,22 @@ class _MockKvBProj(torch.nn.Module):
     导致的分布式环境依赖。接口与 ColumnParallelLinear 保持一致：
     - self.weight: [output_size, input_size]（转置存储，与 nn.Linear 相同）
     - __call__(x) -> (output, None)
+    - cpu_linear(x, weight, bias) -> Tensor
+        与 CPU 路径下 process_weights_after_loading 注入的 `cpu_linear`
+        lambda 保持签名一致，供 CPUMLAImpl._linear 直接调用。
     """
 
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
         # weight shape: [output_size, input_size]，与 ColumnParallelLinear 一致
         self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        # 模拟产品代码中 dispatch_cpu_unquantized_gemm 注入的 cpu_linear。
+        # 真实对象上 layer.cpu_linear(x, layer.weight, bias) 会执行一次线性变换。
+        self.cpu_linear = lambda x, weight, bias=None: torch.nn.functional.linear(
+            x, weight, bias
+        )
+        # 保持与 LinearBase 一致，便于 CPUMLAImpl._linear 里的 getattr 判断。
+        self.skip_bias_add = False
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
         # x: [..., input_size]，output: [..., output_size]
@@ -102,9 +111,12 @@ def _build_kv_b_proj(
     # W_UV: [kv_lora_rank, num_heads, v_head_dim]
     # 拼接后 reshape 为 [kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)]
     # 再转置为 [output_size, kv_lora_rank]，与 nn.Linear weight 布局一致
-    kv_b_proj_weight = torch.cat([W_UK, W_UV], dim=-1).view(
-        kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim)
-    ).T.contiguous().to(device=device, dtype=dtype)
+    kv_b_proj_weight = (
+        torch.cat([W_UK, W_UV], dim=-1)
+        .view(kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim))
+        .T.contiguous()
+        .to(device=device, dtype=dtype)
+    )
 
     return _MockKvBProj(kv_b_proj_weight)
 
@@ -134,12 +146,12 @@ def _create_kv_cache(
     )
     context_lens = seq_lens - query_lens
 
-    total_blocks = sum(
-        cdiv(int(seq_lens[i]), block_size) for i in range(batch_size)
-    )
+    total_blocks = sum(cdiv(int(seq_lens[i]), block_size) for i in range(batch_size))
     num_blocks = total_blocks + 1 + num_extra_blocks
 
-    kv_cache = torch.zeros(num_blocks, block_size, head_size, dtype=dtype, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, head_size, dtype=dtype, device=device
+    )
     kv_cache_flat = kv_cache.view(-1, head_size)
 
     block_table = common_attn_metadata.block_table_tensor
@@ -306,18 +318,18 @@ class MockMLALayer(AttentionLayerBase):
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
             # (B, N, P) -> (N, B, P) -> bmm -> (N, B, L) -> (B, N, L)
-            mqa_ql_nope = torch.bmm(
-                mqa_q_nope.transpose(0, 1), self.W_UK_T
-            ).transpose(0, 1)
+            mqa_ql_nope = torch.bmm(mqa_q_nope.transpose(0, 1), self.W_UK_T).transpose(
+                0, 1
+            )
 
             attn_out, _ = self.impl.forward_mqa(
                 (mqa_ql_nope, mqa_q_pe), kv_cache, attn_metadata, self
             )
 
             # v_up 投影：(B, N, L) x (N, L, V) -> (B, N, V) -> flatten
-            decode_output = torch.bmm(
-                attn_out.transpose(0, 1), self.W_UV
-            ).transpose(0, 1)
+            decode_output = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(
+                0, 1
+            )
             output[:num_decode_tokens] = decode_output.reshape(
                 num_decode_tokens, self.num_heads * self.v_head_dim
             )
@@ -344,7 +356,8 @@ def _compute_sdpa_reference(
     """用 PyTorch SDPA 计算参考输出。
 
     Args:
-        use_decode_path: True 时使用 MQA（decode）路径，False 时使用 MHA（prefill）路径。
+        use_decode_path: True 时使用 MQA（decode）路径，
+            False 时使用 MHA（prefill）路径。
 
     Returns:
         参考输出，shape = [total_query_tokens, num_heads * v_head_dim]
@@ -370,9 +383,11 @@ def _compute_sdpa_reference(
             # MQA 路径（decode absorption）
             ql_nope = torch.einsum("qnh,lnh->qnl", q_nope, W_UK)
             q_mqa = torch.cat([ql_nope, q_pe], dim=-1)
-            k_mqa = torch.cat(
-                [kv_c_full, k_pe_full.squeeze(1)], dim=-1
-            ).unsqueeze(1).expand(-1, num_heads, -1)
+            k_mqa = (
+                torch.cat([kv_c_full, k_pe_full.squeeze(1)], dim=-1)
+                .unsqueeze(1)
+                .expand(-1, num_heads, -1)
+            )
             v_mqa = kv_c_full.unsqueeze(1).expand(-1, num_heads, -1)
 
             # SDPA: (1, N, q_len, D)
@@ -438,9 +453,7 @@ def _run_cpu_mla(
         CPUMLAMetadataBuilder,
     )
 
-    common_attn_metadata = create_common_attn_metadata(
-        batch_spec, BLOCK_SIZE, device
-    )
+    common_attn_metadata = create_common_attn_metadata(batch_spec, BLOCK_SIZE, device)
 
     # 创建并填充 KV Cache
     kv_cache = _create_kv_cache(
@@ -545,9 +558,13 @@ def vllm_config_cpu():
     """创建用于 CPU MLA 测试的 VllmConfig。"""
     # 确保平台检测为 CPU，避免在无 GPU 环境下 DeviceConfig() 失败
     import vllm.platforms as _platforms
-    if not hasattr(_platforms.current_platform, "device_type") \
-            or _platforms.current_platform.device_type != "cpu":
+
+    if (
+        not hasattr(_platforms.current_platform, "device_type")
+        or _platforms.current_platform.device_type != "cpu"
+    ):
         from vllm.platforms.cpu import CpuPlatform
+
         _platforms.current_platform = CpuPlatform()
 
     cfg = create_vllm_config(
@@ -594,16 +611,20 @@ def test_decode_correctness(
     num_heads = vllm_config_cpu.model_config.get_num_attention_heads(
         vllm_config_cpu.parallel_config
     )
-    scale = 1.0 / (HEAD_SIZE ** 0.5)
-    weight_scale = 1.0 / (KV_LORA_RANK ** 0.5)
+    scale = 1.0 / (HEAD_SIZE**0.5)
+    weight_scale = 1.0 / (KV_LORA_RANK**0.5)
 
     # 共享权重矩阵
-    W_UK = torch.randn(
-        KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, dtype=dtype, device=device
-    ) * weight_scale
-    W_UV = torch.randn(
-        KV_LORA_RANK, num_heads, V_HEAD_DIM, dtype=dtype, device=device
-    ) * weight_scale
+    W_UK = (
+        torch.randn(
+            KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, dtype=dtype, device=device
+        )
+        * weight_scale
+    )
+    W_UV = (
+        torch.randn(KV_LORA_RANK, num_heads, V_HEAD_DIM, dtype=dtype, device=device)
+        * weight_scale
+    )
     kv_b_proj = _build_kv_b_proj(
         KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, V_HEAD_DIM, dtype, device, W_UK, W_UV
     )
@@ -619,8 +640,13 @@ def test_decode_correctness(
         q_len = batch_spec.query_lens[i]
         context_len = s_len - q_len
 
-        q_i = torch.randn(q_len, num_heads, QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
-                          dtype=dtype, device=device)
+        q_i = torch.randn(
+            q_len,
+            num_heads,
+            QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
+            dtype=dtype,
+            device=device,
+        )
         kv_c_full = torch.randn(s_len, KV_LORA_RANK, dtype=dtype, device=device)
         k_pe_full = torch.randn(s_len, 1, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
 
@@ -634,19 +660,41 @@ def test_decode_correctness(
 
     # 参考输出（SDPA decode 路径）
     expected = _compute_sdpa_reference(
-        batch_spec, q_list, kv_c_full_list, k_pe_full_list,
-        W_UK, W_UV, kv_b_proj_weight, num_heads,
-        QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, V_HEAD_DIM, KV_LORA_RANK,
-        scale, use_decode_path=True,
+        batch_spec,
+        q_list,
+        kv_c_full_list,
+        k_pe_full_list,
+        W_UK,
+        W_UV,
+        kv_b_proj_weight,
+        num_heads,
+        QK_NOPE_HEAD_DIM,
+        QK_ROPE_HEAD_DIM,
+        V_HEAD_DIM,
+        KV_LORA_RANK,
+        scale,
+        use_decode_path=True,
     )
 
     # CPU MLA 输出
     actual = _run_cpu_mla(
-        batch_spec, q_list, kv_c_new_list, k_pe_new_list,
-        kv_c_ctx_list, k_pe_ctx_list,
-        W_UK, W_UV, kv_b_proj, num_heads,
-        QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, V_HEAD_DIM, KV_LORA_RANK,
-        scale, vllm_config_cpu, device,
+        batch_spec,
+        q_list,
+        kv_c_new_list,
+        k_pe_new_list,
+        kv_c_ctx_list,
+        k_pe_ctx_list,
+        W_UK,
+        W_UV,
+        kv_b_proj,
+        num_heads,
+        QK_NOPE_HEAD_DIM,
+        QK_ROPE_HEAD_DIM,
+        V_HEAD_DIM,
+        KV_LORA_RANK,
+        scale,
+        vllm_config_cpu,
+        device,
     )
 
     assert actual.shape == expected.shape, (
@@ -687,15 +735,19 @@ def test_prefill_correctness(
     num_heads = vllm_config_cpu.model_config.get_num_attention_heads(
         vllm_config_cpu.parallel_config
     )
-    scale = 1.0 / (HEAD_SIZE ** 0.5)
-    weight_scale = 1.0 / (KV_LORA_RANK ** 0.5)
+    scale = 1.0 / (HEAD_SIZE**0.5)
+    weight_scale = 1.0 / (KV_LORA_RANK**0.5)
 
-    W_UK = torch.randn(
-        KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, dtype=dtype, device=device
-    ) * weight_scale
-    W_UV = torch.randn(
-        KV_LORA_RANK, num_heads, V_HEAD_DIM, dtype=dtype, device=device
-    ) * weight_scale
+    W_UK = (
+        torch.randn(
+            KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, dtype=dtype, device=device
+        )
+        * weight_scale
+    )
+    W_UV = (
+        torch.randn(KV_LORA_RANK, num_heads, V_HEAD_DIM, dtype=dtype, device=device)
+        * weight_scale
+    )
     kv_b_proj = _build_kv_b_proj(
         KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, V_HEAD_DIM, dtype, device, W_UK, W_UV
     )
@@ -710,8 +762,13 @@ def test_prefill_correctness(
         q_len = batch_spec.query_lens[i]
         context_len = s_len - q_len
 
-        q_i = torch.randn(q_len, num_heads, QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
-                          dtype=dtype, device=device)
+        q_i = torch.randn(
+            q_len,
+            num_heads,
+            QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
+            dtype=dtype,
+            device=device,
+        )
         kv_c_full = torch.randn(s_len, KV_LORA_RANK, dtype=dtype, device=device)
         k_pe_full = torch.randn(s_len, 1, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
 
@@ -725,18 +782,40 @@ def test_prefill_correctness(
 
     # 参考输出（SDPA prefill 路径）
     expected = _compute_sdpa_reference(
-        batch_spec, q_list, kv_c_full_list, k_pe_full_list,
-        W_UK, W_UV, kv_b_proj_weight, num_heads,
-        QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, V_HEAD_DIM, KV_LORA_RANK,
-        scale, use_decode_path=False,
+        batch_spec,
+        q_list,
+        kv_c_full_list,
+        k_pe_full_list,
+        W_UK,
+        W_UV,
+        kv_b_proj_weight,
+        num_heads,
+        QK_NOPE_HEAD_DIM,
+        QK_ROPE_HEAD_DIM,
+        V_HEAD_DIM,
+        KV_LORA_RANK,
+        scale,
+        use_decode_path=False,
     )
 
     actual = _run_cpu_mla(
-        batch_spec, q_list, kv_c_new_list, k_pe_new_list,
-        kv_c_ctx_list, k_pe_ctx_list,
-        W_UK, W_UV, kv_b_proj, num_heads,
-        QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, V_HEAD_DIM, KV_LORA_RANK,
-        scale, vllm_config_cpu, device,
+        batch_spec,
+        q_list,
+        kv_c_new_list,
+        k_pe_new_list,
+        kv_c_ctx_list,
+        k_pe_ctx_list,
+        W_UK,
+        W_UV,
+        kv_b_proj,
+        num_heads,
+        QK_NOPE_HEAD_DIM,
+        QK_ROPE_HEAD_DIM,
+        V_HEAD_DIM,
+        KV_LORA_RANK,
+        scale,
+        vllm_config_cpu,
+        device,
     )
 
     assert actual.shape == expected.shape, (
@@ -776,15 +855,19 @@ def test_mixed_correctness(
     num_heads = vllm_config_cpu.model_config.get_num_attention_heads(
         vllm_config_cpu.parallel_config
     )
-    scale = 1.0 / (HEAD_SIZE ** 0.5)
-    weight_scale = 1.0 / (KV_LORA_RANK ** 0.5)
+    scale = 1.0 / (HEAD_SIZE**0.5)
+    weight_scale = 1.0 / (KV_LORA_RANK**0.5)
 
-    W_UK = torch.randn(
-        KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, dtype=dtype, device=device
-    ) * weight_scale
-    W_UV = torch.randn(
-        KV_LORA_RANK, num_heads, V_HEAD_DIM, dtype=dtype, device=device
-    ) * weight_scale
+    W_UK = (
+        torch.randn(
+            KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, dtype=dtype, device=device
+        )
+        * weight_scale
+    )
+    W_UV = (
+        torch.randn(KV_LORA_RANK, num_heads, V_HEAD_DIM, dtype=dtype, device=device)
+        * weight_scale
+    )
     kv_b_proj = _build_kv_b_proj(
         KV_LORA_RANK, num_heads, QK_NOPE_HEAD_DIM, V_HEAD_DIM, dtype, device, W_UK, W_UV
     )
@@ -802,8 +885,13 @@ def test_mixed_correctness(
         context_len = s_len - q_len
         is_decode_list.append(q_len == 1)
 
-        q_i = torch.randn(q_len, num_heads, QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
-                          dtype=dtype, device=device)
+        q_i = torch.randn(
+            q_len,
+            num_heads,
+            QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM,
+            dtype=dtype,
+            device=device,
+        )
         kv_c_full = torch.randn(s_len, KV_LORA_RANK, dtype=dtype, device=device)
         k_pe_full = torch.randn(s_len, 1, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
 
@@ -827,19 +915,38 @@ def test_mixed_correctness(
             [q_list[i]],
             [kv_c_full_list[i]],
             [k_pe_full_list[i]],
-            W_UK, W_UV, kv_b_proj_weight, num_heads,
-            QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, V_HEAD_DIM, KV_LORA_RANK,
-            scale, use_decode_path=is_decode_list[i],
+            W_UK,
+            W_UV,
+            kv_b_proj_weight,
+            num_heads,
+            QK_NOPE_HEAD_DIM,
+            QK_ROPE_HEAD_DIM,
+            V_HEAD_DIM,
+            KV_LORA_RANK,
+            scale,
+            use_decode_path=is_decode_list[i],
         )
         expected_parts.append(ref)
     expected = torch.cat(expected_parts, dim=0)
 
     actual = _run_cpu_mla(
-        batch_spec, q_list, kv_c_new_list, k_pe_new_list,
-        kv_c_ctx_list, k_pe_ctx_list,
-        W_UK, W_UV, kv_b_proj, num_heads,
-        QK_NOPE_HEAD_DIM, QK_ROPE_HEAD_DIM, V_HEAD_DIM, KV_LORA_RANK,
-        scale, vllm_config_cpu, device,
+        batch_spec,
+        q_list,
+        kv_c_new_list,
+        k_pe_new_list,
+        kv_c_ctx_list,
+        k_pe_ctx_list,
+        W_UK,
+        W_UV,
+        kv_b_proj,
+        num_heads,
+        QK_NOPE_HEAD_DIM,
+        QK_ROPE_HEAD_DIM,
+        V_HEAD_DIM,
+        KV_LORA_RANK,
+        scale,
+        vllm_config_cpu,
+        device,
     )
 
     assert actual.shape == expected.shape, (
@@ -869,7 +976,7 @@ def test_unsupported_features():
     common_kwargs = dict(
         num_heads=4,
         head_size=HEAD_SIZE,
-        scale=1.0 / HEAD_SIZE ** 0.5,
+        scale=1.0 / HEAD_SIZE**0.5,
         num_kv_heads=4,
         sliding_window=None,
         kv_cache_dtype="auto",
@@ -907,7 +1014,6 @@ def test_gather_kv_cache():
     from vllm.v1.attention.backends.mla.cpu_mla import CPUMLAImpl
 
     torch.manual_seed(0)
-    device = torch.device("cpu")
     block_size = 4
     head_size = 8
     num_blocks = 10
@@ -918,10 +1024,13 @@ def test_gather_kv_cache():
     block_table = torch.tensor([2, 5, 0, 0], dtype=torch.int32)
 
     # 手动构造期望输出
-    expected = torch.cat([
-        kv_cache[2].reshape(-1, head_size),  # block 2 的全部 4 个 token
-        kv_cache[5, :3],                     # block 5 的前 3 个 token
-    ], dim=0)
+    expected = torch.cat(
+        [
+            kv_cache[2].reshape(-1, head_size),  # block 2 的全部 4 个 token
+            kv_cache[5, :3],  # block 5 的前 3 个 token
+        ],
+        dim=0,
+    )
 
     # 创建一个最小化的 CPUMLAImpl 实例（仅用于调用 _gather_kv_cache）
     # 使用 object.__new__ 绕过 __init__

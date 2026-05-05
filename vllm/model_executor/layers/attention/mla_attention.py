@@ -360,6 +360,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.kv_b_proj = kv_b_proj
+        # MLA 吸收路径需要在 process_weights_after_loading 中读取 kv_b_proj
+        # 的原始 weight 切分出 W_UK / W_UV。CPU 侧 dispatch_cpu_unquantized_gemm
+        # 默认会将 Linear.weight 替换为空 tensor 以释放显存，这里打标记让它
+        # 仅构建加速用的 cpu_linear，但保留原始 weight 供 MLAAttention 使用。
+        self.kv_b_proj._preserve_original_weight = True
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer

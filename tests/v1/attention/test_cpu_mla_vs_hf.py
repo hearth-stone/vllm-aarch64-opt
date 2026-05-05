@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """对比测试：CPUMLAImpl vs transformers.DeepseekV3Attention（eager 模式）。
 
 测试目标：
@@ -15,10 +14,11 @@
     # 或直接运行（输出详细的余弦相似度报告）：
     python tests/v1/attention/test_cpu_mla_vs_hf.py
 """
+
 import argparse
+import importlib.util
 import sys
 from dataclasses import dataclass
-from typing import Optional
 
 import pytest
 import torch
@@ -36,21 +36,20 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DeepSeek V3 MLA 超参数（与 DeepSeek-V3/R1 实际配置一致）
 # ──────────────────────────────────────────────────────────────────────────────
-NUM_HEADS = 8           # 测试用，实际为 128
+NUM_HEADS = 8  # 测试用，实际为 128
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
 QK_NOPE_HEAD_DIM = 128
 V_HEAD_DIM = 128
 QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM  # 192
-HEAD_SIZE = KV_LORA_RANK + QK_ROPE_HEAD_DIM          # 576
+HEAD_SIZE = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576
 BLOCK_SIZE = 16
-HIDDEN_SIZE = NUM_HEADS * V_HEAD_DIM                  # 1024（测试用）
+HIDDEN_SIZE = NUM_HEADS * V_HEAD_DIM  # 1024（测试用）
 
 # 余弦相似度阈值
 COSINE_SIM_THRESHOLD = {
@@ -76,6 +75,7 @@ TEST_CASES = {
 # 构造 DeepseekV3Config（最小化配置，仅包含 MLA 所需字段）
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _make_deepseek_v3_config(
     num_heads: int,
     hidden_size: int,
@@ -95,7 +95,8 @@ def _make_deepseek_v3_config(
     :return: DeepseekV3Config 实例
     """
     try:
-        from transformers import AutoConfig
+        if importlib.util.find_spec("transformers") is None:
+            raise ImportError("transformers 未安装")
     except ImportError as exc:
         pytest.skip(f"transformers 库不可用：{exc}")
 
@@ -109,7 +110,7 @@ def _make_deepseek_v3_config(
         hidden_size=hidden_size,
         num_attention_heads=num_heads,
         num_key_value_heads=num_heads,  # MLA 中 num_kv_heads == num_heads
-        q_lora_rank=None,               # 不使用 Q LoRA
+        q_lora_rank=None,  # 不使用 Q LoRA
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         qk_nope_head_dim=qk_nope_head_dim,
@@ -145,6 +146,7 @@ def _make_deepseek_v3_config(
 # ──────────────────────────────────────────────────────────────────────────────
 # 权重容器
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class MLAWeights:
@@ -189,22 +191,27 @@ def _make_mla_weights(
         return torch.randn(*shape, dtype=dtype, device=device, generator=gen)
 
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-    scale = kv_lora_rank ** -0.5
+    scale = kv_lora_rank**-0.5
 
     return MLAWeights(
-        q_proj_weight=_randn(num_heads * qk_head_dim, hidden_size) * (hidden_size ** -0.5),
-        kv_a_proj_weight=_randn(kv_lora_rank + qk_rope_head_dim, hidden_size) * (hidden_size ** -0.5),
+        q_proj_weight=_randn(num_heads * qk_head_dim, hidden_size)
+        * (hidden_size**-0.5),
+        kv_a_proj_weight=_randn(kv_lora_rank + qk_rope_head_dim, hidden_size)
+        * (hidden_size**-0.5),
         kv_a_layernorm_weight=torch.ones(kv_lora_rank, dtype=dtype, device=device),
         kv_b_proj_weight=_randn(
             num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank
-        ) * scale,
-        o_proj_weight=_randn(hidden_size, num_heads * v_head_dim) * ((num_heads * v_head_dim) ** -0.5),
+        )
+        * scale,
+        o_proj_weight=_randn(hidden_size, num_heads * v_head_dim)
+        * ((num_heads * v_head_dim) ** -0.5),
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 构造并运行 transformers.DeepseekV3Attention（eager 模式）
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _build_hf_attention(
     weights: MLAWeights,
@@ -319,7 +326,7 @@ def compute_hf_attn_output(
                 cache_position=None,
             )
         # attn_out: [1, s_len, hidden_size]，只取最后 q_len 个 token
-        outputs.append(attn_out[0, s_len - q_len:, :])
+        outputs.append(attn_out[0, s_len - q_len :, :])
 
     return torch.cat(outputs, dim=0)  # [total_query_tokens, hidden_size]
 
@@ -348,12 +355,22 @@ def _build_causal_mask(
 # CPUMLAImpl 运行辅助
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class _MockKvBProj(nn.Module):
-    """轻量级 kv_b_proj mock，接口与 ColumnParallelLinear 一致。"""
+    """轻量级 kv_b_proj mock，接口与 ColumnParallelLinear 一致。
+
+    除了 forward 外，还提供 `cpu_linear` 属性，与 CPU 路径下
+    dispatch_cpu_unquantized_gemm 注入的 lambda 签名保持一致，
+    供 CPUMLAImpl._linear 直接调用（prefill / mixed 路径）。
+    """
 
     def __init__(self, weight: torch.Tensor) -> None:
         super().__init__()
         self.weight = nn.Parameter(weight, requires_grad=False)
+        # 模拟产品代码里注入的 cpu_linear(x, weight, bias) lambda
+        self.cpu_linear = lambda x, weight, bias=None: F.linear(x, weight, bias)
+        # 与 LinearBase 对齐，避免 _linear 里 getattr(..., 'skip_bias_add') 误判
+        self.skip_bias_add = False
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
         return (F.linear(x, self.weight), None)
@@ -385,8 +402,8 @@ class _MockMLALayer(AttentionLayerBase):
         w = kv_b_proj.weight.T  # [kv_lora_rank, num_heads * (P + V)]
         w = w.view(kv_lora_rank, num_heads, qk_nope_head_dim + v_head_dim)
         w_uk, w_uv = w.split([qk_nope_head_dim, v_head_dim], dim=-1)
-        self.W_UK_T = w_uk.permute(1, 2, 0).contiguous()   # [N, P, L]
-        self.W_UV = w_uv.transpose(0, 1).contiguous()       # [N, L, V]
+        self.W_UK_T = w_uk.permute(1, 2, 0).contiguous()  # [N, P, L]
+        self.W_UV = w_uv.transpose(0, 1).contiguous()  # [N, L, V]
 
         # o_proj 权重，用于将注意力输出投影回 hidden_size
         self.o_proj_weight = o_proj_weight  # [hidden_size, num_heads * v_head_dim]
@@ -464,16 +481,16 @@ class _MockMLALayer(AttentionLayerBase):
             mqa_q_nope, mqa_q_pe = decode_q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
-            mqa_ql_nope = torch.bmm(
-                mqa_q_nope.transpose(0, 1), self.W_UK_T
-            ).transpose(0, 1)
+            mqa_ql_nope = torch.bmm(mqa_q_nope.transpose(0, 1), self.W_UK_T).transpose(
+                0, 1
+            )
 
             attn_out, _ = self.impl.forward_mqa(
                 (mqa_ql_nope, mqa_q_pe), kv_cache, attn_metadata, self
             )
-            decode_output = torch.bmm(
-                attn_out.transpose(0, 1), self.W_UV
-            ).transpose(0, 1)
+            decode_output = torch.bmm(attn_out.transpose(0, 1), self.W_UV).transpose(
+                0, 1
+            )
             output[:num_decode_tokens] = decode_output.reshape(
                 num_decode_tokens, self.num_heads * self.v_head_dim
             )
@@ -505,7 +522,9 @@ def _create_kv_cache(
     total_blocks = sum(cdiv(int(seq_lens[i]), block_size) for i in range(batch_size))
     num_blocks = total_blocks + 1 + num_extra_blocks
 
-    kv_cache = torch.zeros(num_blocks, block_size, head_size, dtype=dtype, device=device)
+    kv_cache = torch.zeros(
+        num_blocks, block_size, head_size, dtype=dtype, device=device
+    )
     kv_cache_flat = kv_cache.view(-1, head_size)
     block_table = common_attn_metadata.block_table_tensor
     slot_mapping = common_attn_metadata.slot_mapping
@@ -520,7 +539,7 @@ def _create_kv_cache(
         if ctx_len > 0:
             kv_ctx = torch.cat([kv_c_ctx, k_pe_ctx.squeeze(1)], dim=-1)
             start_flat = start_block_idx * block_size
-            kv_cache_flat[start_flat:start_flat + ctx_len] = kv_ctx
+            kv_cache_flat[start_flat : start_flat + ctx_len] = kv_ctx
 
         for b in range(num_blocks_for_seq):
             block_table[i, b] = start_block_idx + b
@@ -533,8 +552,8 @@ def _create_kv_cache(
             block_idx = token_pos // block_size
             block_offset = token_pos % block_size
             slot_mapping[q_start + t_idx] = (
-                (start_block_idx + block_idx) * block_size + block_offset
-            )
+                start_block_idx + block_idx
+            ) * block_size + block_offset
 
         start_block_idx += num_blocks_for_seq
 
@@ -659,6 +678,7 @@ def compute_cpu_mla_output(
 # 数据准备
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _apply_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -746,6 +766,7 @@ def _prepare_inputs(
 # 余弦相似度计算
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def cosine_similarity_stats(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -771,6 +792,7 @@ def cosine_similarity_stats(
 # pytest 测试用例
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture(scope="module")
 def cpu_device():
     return torch.device("cpu")
@@ -780,9 +802,13 @@ def cpu_device():
 def vllm_config_for_hf_test():
     """创建用于对比测试的 VllmConfig。"""
     import vllm.platforms as _platforms
-    if not hasattr(_platforms.current_platform, "device_type") \
-            or _platforms.current_platform.device_type != "cpu":
+
+    if (
+        not hasattr(_platforms.current_platform, "device_type")
+        or _platforms.current_platform.device_type != "cpu"
+    ):
         from vllm.platforms.cpu import CpuPlatform
+
         _platforms.current_platform = CpuPlatform()
 
     cfg = create_vllm_config(
@@ -813,7 +839,7 @@ def test_cosine_similarity_vs_hf(
     device = cpu_device
     batch_spec = TEST_CASES[case_name]
     num_heads = NUM_HEADS
-    scaling = QK_HEAD_DIM ** -0.5
+    scaling = QK_HEAD_DIM**-0.5
     threshold = COSINE_SIM_THRESHOLD[dtype]
 
     weights = _make_mla_weights(
@@ -907,12 +933,17 @@ def test_cosine_similarity_vs_hf(
 # 独立运行：输出详细报告
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _run_report(args: argparse.Namespace) -> int:
     """独立运行时输出详细的余弦相似度报告。"""
     import vllm.platforms as _platforms
-    if not hasattr(_platforms.current_platform, "device_type") \
-            or _platforms.current_platform.device_type != "cpu":
+
+    if (
+        not hasattr(_platforms.current_platform, "device_type")
+        or _platforms.current_platform.device_type != "cpu"
+    ):
         from vllm.platforms.cpu import CpuPlatform
+
         _platforms.current_platform = CpuPlatform()
 
     device = torch.device("cpu")
@@ -933,7 +964,8 @@ def _run_report(args: argparse.Namespace) -> int:
     print("CPUMLAImpl vs transformers.DeepseekV3Attention（eager 模式）余弦相似度报告")
     print("=" * 88)
     print(
-        f"{'场景':<30} {'dtype':<12} {'min cos':<12} {'mean cos':<12} {'max cos':<12} {'状态'}"
+        f"{'场景':<30} {'dtype':<12} {'min cos':<12} "
+        f"{'mean cos':<12} {'max cos':<12} {'状态'}"
     )
     print("-" * 88)
 
@@ -942,7 +974,7 @@ def _run_report(args: argparse.Namespace) -> int:
         batch_spec = TEST_CASES[case_name]
         for dtype in dtypes:
             threshold = COSINE_SIM_THRESHOLD[dtype]
-            scaling = QK_HEAD_DIM ** -0.5
+            scaling = QK_HEAD_DIM**-0.5
 
             weights = _make_mla_weights(
                 num_heads=NUM_HEADS,

@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
     VLLM_CPU_INT4_W4A8: bool = True
+    VLLM_CPU_AWQ_USE_FUSED_CPP: bool = False
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
@@ -751,6 +752,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # (CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ.
     "VLLM_CPU_INT4_W4A8": lambda: bool(int(os.getenv("VLLM_CPU_INT4_W4A8", "1"))),
+    # (CPU backend only) whether to route AWQ linear layers to the
+    # fused_cpp w4a8 kernel (per-token int8 activation + per-group int8
+    # weight int8 GEMM path). Requires the `fused_cpp` package to be
+    # importable; otherwise silently falls back to the default AWQ path.
+    "VLLM_CPU_AWQ_USE_FUSED_CPP": lambda: bool(
+        int(os.getenv("VLLM_CPU_AWQ_USE_FUSED_CPP", "0"))
+    ),
     # If the env var is set, Ray Compiled Graph uses the specified
     # channel type to communicate between workers belonging to
     # different pipeline-parallel stages.

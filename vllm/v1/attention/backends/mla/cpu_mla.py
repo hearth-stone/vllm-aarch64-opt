@@ -11,6 +11,7 @@ MLA 核心思路：
 - Decode（MQA）：将 q_nope 通过 W_UK_T 投影到潜在空间，直接与 kv_c 做 MQA 注意力，
   再将输出通过 W_UV 上投影回 v_head_dim 空间
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,12 +20,9 @@ from typing import ClassVar
 import torch
 import torch.nn.functional as F
 
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
-
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonDecodeMetadata,
@@ -36,6 +34,8 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     AttentionType,
 )
+
+logger = init_logger(__name__)
 
 
 class CPUMLABackend(MLACommonBackend):
@@ -53,11 +53,11 @@ class CPUMLABackend(MLACommonBackend):
         return "CPU_MLA"
 
     @staticmethod
-    def get_impl_cls() -> type["CPUMLAImpl"]:
+    def get_impl_cls() -> type[CPUMLAImpl]:
         return CPUMLAImpl
 
     @staticmethod
-    def get_builder_cls() -> type["CPUMLAMetadataBuilder"]:
+    def get_builder_cls() -> type[CPUMLAMetadataBuilder]:
         return CPUMLAMetadataBuilder
 
     @classmethod
@@ -89,12 +89,14 @@ class CPUMLABackend(MLACommonBackend):
 @dataclass
 class CPUMLADecodeMetadata(MLACommonDecodeMetadata):
     """CPU MLA Decode 阶段的元数据。"""
+
     pass
 
 
 @dataclass
 class CPUMLAMetadata(MLACommonMetadata[CPUMLADecodeMetadata]):
     """CPU MLA 的注意力元数据。"""
+
     pass
 
 
@@ -212,62 +214,6 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         # CPU 不需要 pad v（SDPA 支持不同的 q/v head dim）
         self._pad_v = False
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        """覆盖父类方法，在权重被清空前提取 kv_b_proj 权重构建 W_UK_T 和 W_UV。
-
-        CPU 路径下，dispatch_cpu_unquantized_gemm 可能将 kv_b_proj.weight 打包进
-        cpu_linear 并将 layer.weight 替换为空 tensor（例如 sgl kernel 路径）。
-        由于 quant_method.process_weights_after_loading 在本方法之前执行，
-        此时 kv_b_proj.weight 可能已是 torch.empty(0)。
-
-        因此本方法完全覆盖父类 MLACommonImpl.process_weights_after_loading，
-        不调用 super()，避免父类通过 get_and_maybe_dequant_weights 再次读取
-        已被清空的 weight 导致 AssertionError。
-        """
-        kv_b_weight = self.kv_b_proj.weight
-        if kv_b_weight.numel() == 0:
-            # weight 已被清空，通过 cpu_linear 使用单位矩阵探测恢复原始权重
-            eye = torch.eye(
-                self.kv_lora_rank,
-                dtype=act_dtype,
-                device=kv_b_weight.device,
-            )
-            kv_b_proj_weight = self.kv_b_proj.quant_method.apply(
-                self.kv_b_proj, eye, bias=None
-            ).to(act_dtype)
-        else:
-            kv_b_proj_weight = kv_b_weight.to(act_dtype).T
-
-        assert kv_b_proj_weight.shape == (
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-        ), (
-            f"{kv_b_proj_weight.shape=}, "
-            f"{self.kv_lora_rank=}, "
-            f"{self.num_heads=}, "
-            f"{self.qk_nope_head_dim=}, "
-            f"{self.v_head_dim=}"
-        )
-
-        kv_b_proj_weight = kv_b_proj_weight.view(
-            self.kv_lora_rank,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
-        w_uk, w_uv = kv_b_proj_weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
-        # W_UK_T: [num_heads, qk_nope_head_dim, kv_lora_rank]
-        self.W_UK_T = w_uk.permute(1, 2, 0).contiguous()
-        # W_UV: [num_heads, kv_lora_rank, v_head_dim]
-        self.W_UV = w_uv.transpose(0, 1).contiguous()
-
-        logger.debug(
-            "process_weights_after_loading: W_UK_T=%s, W_UV=%s",
-            tuple(self.W_UK_T.shape),
-            tuple(self.W_UV.shape),
-        )
-
     def _flash_attn_varlen_diff_headdims(
         self,
         q: torch.Tensor,
@@ -318,12 +264,16 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         )
 
         # lse: [num_heads, total_q_tokens]，初始化为 -inf
-        lse = torch.full(
-            (num_heads, total_q_tokens),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q.device,
-        ) if return_softmax_lse else None
+        lse = (
+            torch.full(
+                (num_heads, total_q_tokens),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            if return_softmax_lse
+            else None
+        )
 
         cu_seqlens_q_cpu = cu_seqlens_q.cpu().numpy()
         cu_seqlens_k_cpu = cu_seqlens_k.cpu().numpy()
@@ -450,7 +400,9 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         """纯 PyTorch 实现 LSE merge，合并两段注意力输出。
 
         数学公式（参考 https://www.arxiv.org/pdf/2501.01005 Section 2.2）：
-            p_scale = exp(p_lse - max_lse) / (exp(p_lse - max_lse) + exp(s_lse - max_lse))
+            p_scale = exp(p_lse - max_lse) / (
+                exp(p_lse - max_lse) + exp(s_lse - max_lse)
+            )
             s_scale = 1 - p_scale
             output = p_scale * prefix_output + s_scale * suffix_output
 
@@ -477,10 +429,9 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         p_scale = p_se / out_se
         s_scale = s_se / out_se
 
-        merged = (
-            p_scale * prefix_output.float()
-            + s_scale * suffix_output.float()
-        ).to(prefix_output.dtype)
+        merged = (p_scale * prefix_output.float() + s_scale * suffix_output.float()).to(
+            prefix_output.dtype
+        )
         return merged
 
     def _cpu_compute_prefill_context(
@@ -495,7 +446,8 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
 
         Args:
             q: shape = [num_prefill_tokens, num_heads, qk_head_dim]
-            kv_c_and_k_pe_cache: shape = [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+            kv_c_and_k_pe_cache: shape =
+                [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
             attn_metadata: 注意力元数据
 
         Returns:
@@ -506,16 +458,15 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         if prefill_metadata.chunked_context is None:
-            raise AssertionError(
-                "prefill_metadata.chunked_context is None"
-            )
+            raise AssertionError("prefill_metadata.chunked_context is None")
 
         block_size = kv_c_and_k_pe_cache.shape[1]
         block_table = prefill_metadata.block_table  # [num_prefills, max_blocks]
         num_prefills = block_table.shape[0]
 
         # 从 chunked_context 中获取每个序列的 context 长度
-        # cu_seq_lens[0]: [num_prefills + 1]，第一个 chunk 的累积长度即为各序列 context 长度
+        # cu_seq_lens[0]: [num_prefills + 1]，
+        # 第一个 chunk 的累积长度即为各序列 context 长度
         cu_seq_lens_first = prefill_metadata.chunked_context.cu_seq_lens[0]
         context_lens = (
             cu_seq_lens_first[1:] - cu_seq_lens_first[:-1]
@@ -533,12 +484,17 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
             num_tokens = q.shape[0]
             num_heads = q.shape[1]
             context_output = torch.zeros(
-                num_tokens, num_heads, self.v_head_dim,
-                dtype=q.dtype, device=q.device,
+                num_tokens,
+                num_heads,
+                self.v_head_dim,
+                dtype=q.dtype,
+                device=q.device,
             )
             context_lse = torch.full(
-                (num_heads, num_tokens), float("-inf"),
-                dtype=torch.float32, device=q.device,
+                (num_heads, num_tokens),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q.device,
             )
             return context_output, context_lse
 
@@ -729,12 +685,18 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
 
         block_size = kv_c_and_k_pe_cache.shape[1]
 
+        # 优化 2：将 q_nope_proj 和 q_pe 沿特征维拼接为 [B, N, L + R]，
+        # KV cache 本就是 [L + R] 拼接存储，这样可以一次 matmul 完成
+        # q_l @ kv_c.T + q_pe @ k_pe.T = q_cat @ kv_cat.T
+        # q_cat: [B, N, L + R]
+        q_cat = torch.cat([q_nope_proj, q_pe], dim=-1)
+
         for b in range(batch_size):
-            seq_len = seq_lens_cpu[b].item()
+            seq_len = int(seq_lens_cpu[b].item())
             if seq_len == 0:
                 continue
 
-            # 收集该请求的所有 KV cache token
+            # 优化 1：向量化 _gather_kv_cache，一次 index_select 替代逐 block for 循环
             # gathered_kv: [seq_len, kv_lora_rank + qk_rope_head_dim]
             gathered_kv = self._gather_kv_cache(
                 kv_c_and_k_pe_cache,
@@ -743,30 +705,15 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
                 block_size,
             )
 
-            # 分离 kv_c 和 k_pe
-            # kv_c: [seq_len, kv_lora_rank]
-            # k_pe_seq: [seq_len, qk_rope_head_dim]
-            kv_c = gathered_kv[:, : self.kv_lora_rank]
-            k_pe_seq = gathered_kv[:, self.kv_lora_rank :]
-
-            # 计算注意力分数（在潜在空间）
-            # q_nope_proj[b]: [N, kv_lora_rank]
-            # q_pe[b]: [N, qk_rope_head_dim]
-            # kv_c: [seq_len, kv_lora_rank]
-            # k_pe_seq: [seq_len, qk_rope_head_dim]
-
-            # 注意力分数 = q_l @ kv_c.T + q_pe @ k_pe.T
-            # shape: [N, seq_len]
-            attn_scores = (
-                torch.matmul(q_nope_proj[b], kv_c.T)
-                + torch.matmul(q_pe[b], k_pe_seq.T)
-            ) * self.scale
+            # 合并的注意力分数 gemm：[N, L + R] @ [L + R, seq_len] -> [N, seq_len]
+            attn_scores = torch.mm(q_cat[b], gathered_kv.t()) * self.scale
 
             # softmax
             attn_weights = F.softmax(attn_scores, dim=-1)
 
             # 加权求和：[N, seq_len] @ [seq_len, kv_lora_rank] -> [N, kv_lora_rank]
-            output[b] = torch.matmul(attn_weights, kv_c)
+            # 只取 kv_c 部分（前 kv_lora_rank 列），避免引入 k_pe
+            output[b] = torch.mm(attn_weights, gathered_kv[:, : self.kv_lora_rank])
 
         return output, None
 
@@ -779,6 +726,10 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
     ) -> torch.Tensor:
         """从分页 KV cache 中收集指定序列的所有 token。
 
+        优化：使用 index_select 一次性 gather 所有需要的 block，避免逐 block
+        的 Python for 循环和 .item() 同步开销。对长序列（num_blocks 较多）
+        提升明显。
+
         Args:
             kv_cache: shape = [num_blocks, block_size, head_size]
             block_table: 该请求的 block 索引，shape = [max_blocks]
@@ -786,30 +737,19 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
             block_size: 每个 block 的 token 数
 
         Returns:
-            gathered: shape = [seq_len, head_size]
+            gathered: shape = [seq_len, head_size]，连续存储
         """
         head_size = kv_cache.shape[2]
-        gathered = torch.empty(
-            seq_len,
-            head_size,
-            dtype=kv_cache.dtype,
-            device=kv_cache.device,
-        )
+        # 向上取整，覆盖 seq_len 所需的全部 block
+        num_blocks = (seq_len + block_size - 1) // block_size
 
-        num_full_blocks = seq_len // block_size
-        remainder = seq_len % block_size
+        # 一次 index_select：[num_blocks, block_size, head_size]
+        block_ids = block_table[:num_blocks]
+        gathered = kv_cache.index_select(0, block_ids)
 
-        for block_idx in range(num_full_blocks):
-            block_num = block_table[block_idx].item()
-            start = block_idx * block_size
-            gathered[start : start + block_size] = kv_cache[block_num]
-
-        if remainder > 0:
-            block_num = block_table[num_full_blocks].item()
-            start = num_full_blocks * block_size
-            gathered[start : start + remainder] = kv_cache[block_num, :remainder]
-
-        return gathered
+        # reshape 为 [num_blocks * block_size, head_size] 后截断到 seq_len
+        # 返回 contiguous 张量，便于后续 gemm 高效访存
+        return gathered.reshape(num_blocks * block_size, head_size)[:seq_len]
 
     def do_kv_cache_update(
         self,
@@ -857,10 +797,11 @@ class CPUMLAImpl(MLACommonImpl[CPUMLAMetadata]):
 
     @staticmethod
     def _linear(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-        """直接调用 cpu_linear，绕过 Linear 层的 dispatch 机制。
+        """通过 `cpu_linear` 执行 Linear，走 oneDNN / sgl 的 CPU 加速路径。
 
-        CPU 上 process_weights_after_loading 会将权重打包进 cpu_linear lambda，
-        并将 layer.weight 替换为空 tensor，因此必须通过 cpu_linear 调用。
+        `dispatch_cpu_unquantized_gemm` 会为每个 Linear 构建加速用的
+        `cpu_linear`（oneDNN / sgl kernel 封装）。直接走 `cpu_linear` 可以
+        绕过 `Linear.forward` 内部的 dispatch 逻辑，减少一层间接调用开销。
 
         :param layer: Linear 层（含 cpu_linear 属性）
         :param x: 输入张量

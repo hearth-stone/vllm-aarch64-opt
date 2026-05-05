@@ -228,6 +228,12 @@ def dispatch_cpu_unquantized_gemm(
         layer.cpu_linear = torch.nn.functional.linear
         return
 
+    # 若该 Linear 的原始 weight 会被其它模块读取（例如 MLA 的 kv_b_proj
+    # 需要在 MLAAttention.process_weights_after_loading 中切分出
+    # W_UK_T / W_UV），则仍然构建加速用的 cpu_linear，但保留原始 weight。
+    preserve_weight = getattr(layer, "_preserve_original_weight", False)
+    effective_remove = remove_weight and not preserve_weight
+
     N, K = layer.weight.size()
     dtype = layer.weight.dtype
 
@@ -264,7 +270,7 @@ def dispatch_cpu_unquantized_gemm(
         layer.cpu_linear = lambda x, weight, bias: torch.ops._C.weight_packed_linear(
             x, packed_weight, bias_f32 if bias is not None else None, True
         )
-        if remove_weight:
+        if effective_remove:
             layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
         return
     elif (
@@ -275,7 +281,7 @@ def dispatch_cpu_unquantized_gemm(
             origin_weight = layer.weight
             handler = ops.create_onednn_mm(origin_weight.t(), 32)
             layer.cpu_linear = lambda x, weight, bias: ops.onednn_mm(handler, x, bias)
-            if remove_weight:
+            if effective_remove:
                 layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
             return
         except RuntimeError as e:
