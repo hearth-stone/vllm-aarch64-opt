@@ -113,6 +113,22 @@ class CPUAWQConfig(QuantizationConfig):
         # 这是 AArch64 CPU + AWQ 的唯一可用入口。
         if envs.VLLM_CPU_AWQ_USE_FUSED_CPP:
             return None
+        # 硬件门槛：cpu_wna16 路径依赖的 cpu_gemm_wna16 / int4_scaled_mm_cpu /
+        # convert_weight_packed_scale_zp 等算子，仅在 x86 + AVX512（部分还需
+        # Intel AMX）条件下由 cmake/cpu_extension.cmake 编入扩展。非 x86 平台
+        # （如 AArch64 鲲鹏）运行时会抛 `_OpNamespace '_C' has no attribute
+        # 'cpu_gemm_wna16'`。此处直接放弃劫持，回落到标准 AWQConfig 的
+        # awq_dequantize + matmul 通用路径，避免在 ARM 上崩溃。
+        import platform
+        if platform.machine().lower() not in ("x86_64", "amd64"):
+            logger.warning_once(
+                "CPUAWQConfig (cpu_wna16) 仅在 x86_64 + AVX512 CPU 上可用，"
+                "当前机器为 %s，已放弃劫持 AWQ，改由标准 AWQConfig 接管。"
+                "若需在 AArch64 上运行 AWQ，请设置 VLLM_CPU_AWQ_USE_FUSED_CPP=1 "
+                "启用 fused_cpp.w4a8_linear 快路径。",
+                platform.machine(),
+            )
+            return None
         if current_platform.is_cpu() and (quant_method == "awq"):
             return cls.get_name()
         return None
