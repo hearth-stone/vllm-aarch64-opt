@@ -5903,7 +5903,8 @@ class GPUModelRunner(
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
-        # Calls torch.accelerator.synchronize()
+        # Calls self._sync_device() (torch.accelerator.synchronize() on GPU,
+        # no-op on CPU)
         self._cleanup_profiling_kv_cache()
         self.compilation_config.static_forward_context.clear()
         self.model = None  # type: ignore[assignment]
@@ -5912,7 +5913,9 @@ class GPUModelRunner(
         reset_workspace_manager()
 
     def _cleanup_profiling_kv_cache(self) -> None:
-        torch.accelerator.synchronize()
+        # Use _sync_device() so CPU subclasses can no-op (no accelerator
+        # available on CPU-only backends).
+        self._sync_device()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -5941,7 +5944,8 @@ class GPUModelRunner(
                     layer.impl._v_scale_cache = None
 
         gc.collect()
-        torch.accelerator.empty_cache()
+        if not current_platform.is_cpu():
+            torch.accelerator.empty_cache()
 
         logger.debug("Cleaned up profiling KV cache and CUDA graphs")
 
