@@ -496,9 +496,12 @@ class CPUAWQFusedMoEMethod(FusedMoEMethodBase):
                 f"hidden_size / intermediate 必须被 pack_factor={pack} 整除"
             )
 
-        layer.num_experts = num_experts
-        layer.hidden_size = hidden_size
-        layer.intermediate_size_per_partition = intermediate_size_per_partition
+        # 注意：``FusedMoE`` 已经把 ``hidden_size`` / ``intermediate_size_per_partition``
+        # 定义为只读 ``@property``（分别返回 ``moe_config.hidden_dim`` 与
+        # ``moe_config.intermediate_size_per_partition``），直接赋值会触发
+        # ``AttributeError: property ... has no setter``。同理 ``num_experts``
+        # 语义上等价于 ``local_num_experts``，也无需挂成自定义字段。
+        # 这里只挂 ``group_size`` 这个 AWQ 特有、FusedMoE 本身没有的属性。
         layer.group_size = group_size
 
         h_groups = hidden_size // group_size
@@ -550,7 +553,11 @@ class CPUAWQFusedMoEMethod(FusedMoEMethodBase):
         只处理两类后缀：
           * qweight / qzeros / scales —— 其它后缀（``g_idx`` 等）直接跳过。
         """
-        num_experts = layer.num_experts
+        # ``FusedMoE.local_num_experts`` 是本 rank 持有的 expert 数（TP-only
+        # 场景下等于 ``global_num_experts``），与 create_weights 形参
+        # ``num_experts`` 同源。``hidden_size`` / ``intermediate_size_per_partition``
+        # 均为只读 property，直接读取 moe_config。
+        num_experts = layer.local_num_experts
         intermediate_size_per_partition = layer.intermediate_size_per_partition
         group_size = layer.group_size
         # TP rank/size：与 MoeWNA16 保持一致的获取方式
@@ -645,7 +652,7 @@ class CPUAWQFusedMoEMethod(FusedMoEMethodBase):
         """把 ``w13_*`` 按 N 维拆成 ``gate_*`` / ``up_*``，构造 ``AWQFusedMoEImpl``。"""
         from fused_cpp import AWQFusedMoEImpl
 
-        num_experts = layer.num_experts
+        num_experts = layer.local_num_experts
         h = layer.hidden_size
         f_dim = layer.intermediate_size_per_partition
         pack = 8
