@@ -389,8 +389,9 @@ set(VLLM_EXT_SRC
     "csrc/cpu/pos_encoding.cpp"
     "csrc/moe/dynamic_4bit_int_moe_cpu.cpp"
     "csrc/cpu/cpu_attn.cpp"
+    "csrc/cpu/kunpeng_allreduce.cpp"
     "csrc/cpu/torch_bindings.cpp")
-
+set_source_files_properties("csrc/cpu/kunpeng_allreduce.cpp" PROPERTIES COMPILE_FLAGS "-march=armv8.2-a+sve+bf16")
 if (ASIMD_FOUND AND NOT APPLE_SILICON_FOUND)
     set(VLLM_EXT_SRC
         "csrc/cpu/shm.cpp"

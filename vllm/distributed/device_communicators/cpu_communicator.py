@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import collections
 from typing import Any
 
 import torch
@@ -29,6 +30,15 @@ class CpuCommunicator(DeviceCommunicatorBase):
         self.dist_module = torch.distributed
 
         if (
+            current_platform.get_cpu_architecture() == CpuArchEnum.ARM
+            and hasattr(torch.ops.vllm, "kunpeng_all_reduce")
+            and (unique_name.startswith("tp") or unique_name.startswith("pp"))
+            and self._all_group_ranks_share_shm_group_name()
+        ):
+            logger.info(f"🚀 Activating Kunpeng SVE Engine for group {unique_name}!")
+            self.dist_module = _KunpengSVEDistributed(self)
+            
+        elif (
             (
                 current_platform.get_cpu_architecture() == CpuArchEnum.X86
                 or current_platform.get_cpu_architecture() == CpuArchEnum.ARM
@@ -38,6 +48,17 @@ class CpuCommunicator(DeviceCommunicatorBase):
             and self._all_group_ranks_share_shm_group_name()
         ):
             self.dist_module = _CPUSHMDistributed(self)
+            
+        # if (
+        #     (
+        #         current_platform.get_cpu_architecture() == CpuArchEnum.X86
+        #         or current_platform.get_cpu_architecture() == CpuArchEnum.ARM
+        #     )
+        #     and hasattr(torch.ops._C, "init_shm_manager")
+        #     and (unique_name.startswith("tp") or unique_name.startswith("pp"))
+        #     and self._all_group_ranks_share_shm_group_name()
+        # ):
+        #     self.dist_module = _CPUSHMDistributed(self)
         elif unique_name.startswith("tp") or unique_name.startswith("pp"):
             logger.info(
                 "CPU SHM communicator disabled for group %s: ranks do not share "
@@ -338,3 +359,85 @@ class _CPUSHMDistributed:
         for key, size, t in zip(key_list, size_list, value_list):
             tensor_dict[key] = t.view(size)
         return tensor_dict
+
+class _KunpengSVEDistributed(_CPUSHMDistributed):
+    """
+    kunpeng:sve all_redcue
+    """
+    def __init__(self, communicator: CpuCommunicator):
+        super().__init__(communicator)
+        
+
+        self.max_pool_size = 10
+        self._shm_tensor_pool = collections.OrderedDict()
+        
+        self.group = self.communicator.device_group
+        self.rank = torch.distributed.get_rank(group=self.group)
+        self.world_size = self.communicator.world_size
+
+    def _sync(self):
+        if self.group is not None:
+            torch.distributed.barrier(group=self.group)
+        else:
+            torch.distributed.barrier()
+
+    def _get_shm_tensor(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
+        if numel in self._shm_tensor_pool:
+            self._shm_tensor_pool.move_to_end(numel)
+            return self._shm_tensor_pool[numel]
+
+        if len(self._shm_tensor_pool) >= self.max_pool_size:
+            oldest_numel, oldest_tensor = self._shm_tensor_pool.popitem(last=False)
+            del oldest_tensor
+
+        shm_filename = f"/dev/shm/kunpeng_pool_{self.group_name}_{numel}"
+        
+        if self.rank == 0:
+            if os.path.exists(shm_filename):
+                os.remove(shm_filename)
+            fd = os.open(shm_filename, os.O_CREAT | os.O_RDWR, 0o666)
+
+            element_size = torch.tensor([], dtype=dtype).element_size()
+            os.ftruncate(fd, self.world_size * numel * element_size) 
+            os.close(fd)
+            
+        self._sync()
+        
+        shm_tensor = torch.from_file(
+            shm_filename, shared=True, size=self.world_size * numel, dtype=dtype
+        ).view(self.world_size, -1)
+        
+        self._sync()
+        if self.rank == 0:
+            os.remove(shm_filename) 
+            
+        self._shm_tensor_pool[numel] = shm_tensor
+        return shm_tensor
+
+    def all_reduce(self, input_: torch.Tensor, group: ProcessGroup | None = None) -> None:
+        tensor = input_.contiguous()
+        numel = tensor.numel()
+        
+        shm_tensor = self._get_shm_tensor(numel, tensor.dtype)
+        
+        shm_tensor[self.rank].copy_(tensor.view(-1))
+        self._sync()
+
+        if self.world_size == 4:
+            if self.rank == 0: 
+                torch.ops.vllm.kunpeng_all_reduce(shm_tensor[0], shm_tensor[1])
+            elif self.rank == 2: 
+                torch.ops.vllm.kunpeng_all_reduce(shm_tensor[2], shm_tensor[3])
+            self._sync()
+
+            if self.rank == 0: 
+                torch.ops.vllm.kunpeng_all_reduce(shm_tensor[0], shm_tensor[2])
+            self._sync()
+        else:
+            if self.rank == 0:
+                for i in range(1, self.world_size):
+                    torch.ops.vllm.kunpeng_all_reduce(shm_tensor[0], shm_tensor[i])
+            self._sync()
+
+        input_.view(-1).copy_(shm_tensor[0])
+        self._sync()
