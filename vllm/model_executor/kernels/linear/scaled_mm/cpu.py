@@ -50,9 +50,17 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         ):
             self.linear_method = self._apply_weights_sgl
             self.process_weights_for_sgl(layer)
-        else:
+        elif hasattr(torch.ops._C, "create_onednn_scaled_mm_handler"):
             self.linear_method = self._apply_weights_onednn
             self.process_weights_for_onednn(layer)
+        else:
+            # Fallback for builds without oneDNN INT8 ops (e.g. macOS arm64
+            # wheels). Eagerly dequantize INT8 weights to the model dtype and
+            # use ``F.linear`` at runtime. This trades performance for
+            # correctness — activations skip the int8 round-trip, so results
+            # are at least as accurate as true W8A8.
+            self.linear_method = self._apply_weights_dequant
+            self.process_weights_for_dequant(layer)
 
     def process_weights_for_onednn(self, layer: torch.nn.Module) -> None:
         # WEIGHT
@@ -219,6 +227,53 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
             x.dtype,
             True,
         )
+
+    # ------------------------------------------------------------------
+    # Dequant fallback (no oneDNN INT8 ops in the build)
+    # ------------------------------------------------------------------
+    def process_weights_for_dequant(self, layer: torch.nn.Module) -> None:
+        """Dequantize INT8 weights with their per-channel scales and store
+        as a plain floating-point parameter. Used when the build lacks oneDNN
+        INT8 ops (no ``torch.ops._C.create_onednn_scaled_mm_handler``).
+        """
+        w_q_name, w_s_name, *_ = self.layer_param_names
+        weight_q = getattr(layer, w_q_name)  # [N, K] int8
+
+        # Match the oneDNN path: fused modules with per-tensor scales need
+        # to be expanded to per-channel before dequantization.
+        is_fused_module = len(layer.logical_widths) > 1
+        weight_scale = getattr(layer, w_s_name)
+        if is_fused_module and not self.config.is_channelwise:
+            weight_scale = convert_to_channelwise(weight_scale, layer.logical_widths)
+
+        # weight_scale may be 0-d (per-tensor), 1-d [N], or 2-d [N, 1].
+        # Reshape to [N, 1] for broadcasting against [N, K].
+        scale = weight_scale.float()
+        if scale.dim() == 0:
+            pass  # scalar broadcasts fine
+        else:
+            scale = scale.reshape(-1, 1)
+
+        target_dtype = torch.get_default_dtype()
+        weight = (weight_q.to(torch.float32) * scale).to(target_dtype)
+
+        replace_parameter(
+            layer,
+            w_q_name,
+            torch.nn.Parameter(weight, requires_grad=False),
+        )
+
+    def _apply_weights_dequant(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        w = getattr(layer, self.layer_param_names[0])
+        if w.dtype != x.dtype:
+            # Defensive cast in case the model dtype was changed after load.
+            w = w.to(x.dtype)
+        return torch.nn.functional.linear(x, w, bias)
 
 
 class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
