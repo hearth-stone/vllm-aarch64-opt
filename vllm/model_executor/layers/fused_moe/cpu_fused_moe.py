@@ -13,7 +13,6 @@ from vllm._custom_ops import (
     cpu_prepack_moe_weight,
     fused_experts_cpu,
 )
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils.layer_utils import replace_parameter
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -46,11 +45,29 @@ def _gelu_and_mul(
     return F.gelu(x[..., :d], approximate="none") * x[..., d:]
 
 
+def _silu_and_mul(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """PyTorch-native implementation of SiluAndMul.forward_native.
+
+    Standalone function to avoid instantiating SiluAndMul (a CustomOp)
+    which would trigger get_current_vllm_config() before config is set.
+    The custom op runs inside torch.ops.vllm.cpu_fused_moe_torch (a
+    direct_register_custom_op opaque op) where the surrounding
+    set_current_vllm_config() context does not propagate, so any
+    CustomOp ``__init__`` call here will hit the
+    "Current vLLM config is not set" assertion in
+    ``vllm/config/vllm.py:get_current_vllm_config``.
+    """
+    d = x.shape[-1] // 2
+    return F.silu(x[..., :d]) * x[..., d:]
+
+
 # Map activation names to their native forward functions.
 # Uses static methods or standalone functions to avoid instantiating CustomOp
 # classes, which would call get_current_vllm_config() before config is set.
 _CPU_MOE_ACT_FN: dict[MoEActivation, Callable[[torch.Tensor], torch.Tensor]] = {
-    MoEActivation.SILU: lambda x: SiluAndMul(compile_native=False).forward_native(x),
+    MoEActivation.SILU: _silu_and_mul,
     MoEActivation.SWIGLUOAI: _swigluoai_forward_native,
     MoEActivation.GELU: _gelu_and_mul,
 }

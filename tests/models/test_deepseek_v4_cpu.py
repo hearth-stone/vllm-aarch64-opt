@@ -414,3 +414,38 @@ def test_cpu_select_experts_supports_dsv4_sqrtsoftplus_with_bias():
             renormalize=True,
             scoring_func="not_a_real_scoring_func",
         )
+
+
+def test_cpu_moe_act_fn_silu_does_not_require_vllm_config():
+    """CPU MoE SILU activation should not instantiate a CustomOp."""
+    from torch.nn import functional as F
+
+    import vllm.config.vllm as vllm_cfg
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.cpu_fused_moe import _CPU_MOE_ACT_FN
+
+    saved_cfg = vllm_cfg._current_vllm_config
+    vllm_cfg._current_vllm_config = None
+    vllm_cfg.get_cached_compilation_config.cache_clear()
+    try:
+        torch.manual_seed(0)
+        x = torch.randn(3, 16, dtype=torch.float32)
+        for act in (
+            MoEActivation.SILU,
+            MoEActivation.SWIGLUOAI,
+            MoEActivation.GELU,
+        ):
+            out = _CPU_MOE_ACT_FN[act](x)
+            assert out.shape == (3, 8)
+
+        d = x.shape[-1] // 2
+        expected = F.silu(x[..., :d]) * x[..., d:]
+        torch.testing.assert_close(
+            _CPU_MOE_ACT_FN[MoEActivation.SILU](x),
+            expected,
+            rtol=1e-6,
+            atol=1e-7,
+        )
+    finally:
+        vllm_cfg._current_vllm_config = saved_cfg
+        vllm_cfg.get_cached_compilation_config.cache_clear()
