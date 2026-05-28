@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.cpu_model_runner import CPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
+from vllm.v1.worker.workspace import init_workspace_manager
 
 logger = init_logger(__name__)
 
@@ -139,6 +140,14 @@ class CPUWorker(Worker):
         )
         # Set random seed.
         set_random_seed(self.model_config.seed)
+
+        # Initialize workspace manager on CPU. The base `Worker.init_device`
+        # (GPU path) does this after device selection; we override the whole
+        # method here so the CPU equivalent must be wired explicitly. Without
+        # it `current_workspace_manager()` asserts during `_dummy_run` ->
+        # DSV4 `torch.ops.vllm.deepseek_v4_attention` -> `attention_impl`.
+        num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        init_workspace_manager(torch.device("cpu"), num_ubatches)
 
         # Construct the model runner
         self.model_runner: CPUModelRunner = CPUModelRunner(
