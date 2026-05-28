@@ -751,7 +751,20 @@ class DeepseekV4Attention(nn.Module):
             prefix=f"{prefix}.wo_b",
         )
         self.softmax_scale = self.head_dim**-0.5
-        self.scale_fmt = config.quantization_config["scale_fmt"]
+        # ``scale_fmt`` is the FP8 quant-scale format (``"ue8m0"`` for the
+        # DeepGEMM UE8M0 path). BF16 checkpoints (e.g.
+        # ``huihui-ai/DeepSeek-V4-Flash-BF16``) ship without a top-level
+        # ``quantization_config`` field at all, so reaching for
+        # ``config.quantization_config["scale_fmt"]`` would AttributeError /
+        # KeyError on those — even though no GPU FP8 kernel that consumes
+        # this attribute ever fires on the BF16 path. ``DeepseekV4Indexer``
+        # (line ~1401 in deepseek_v4_attention.py) hardcodes its own
+        # ``scale_fmt = "ue8m0"`` so the indexer side is unaffected.
+        quantization_config = getattr(config, "quantization_config", None)
+        if quantization_config is not None and "scale_fmt" in quantization_config:
+            self.scale_fmt = quantization_config["scale_fmt"]
+        else:
+            self.scale_fmt = None
 
         self.rope_parameters = config.rope_scaling
 
