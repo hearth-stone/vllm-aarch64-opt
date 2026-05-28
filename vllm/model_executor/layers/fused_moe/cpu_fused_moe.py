@@ -142,16 +142,42 @@ def select_experts(
             e_score_correction_bias=e_score_correction_bias,
         )
     elif custom_routing_function is None:
-        assert scoring_func == "softmax"
-        topk_logit_vals, topk_idx = torch.topk(
-            router_logits, k=top_k, dim=-1, sorted=False
-        )
-        if renormalize:
-            topk_vals = torch.softmax(topk_logit_vals, dim=-1)
+        # Plain (non-grouped) top-k routing. Supports the same three
+        # scoring functions as the GPU fallback in
+        # ``fused_topk_bias_router.py:197-228``: softmax / sigmoid /
+        # sqrtsoftplus, optionally combined with
+        # ``e_score_correction_bias`` (DeepSeek V4 noaux_tc routing)
+        # and ``routed_scaling_factor``. The original CPU path only
+        # handled softmax and would assert on DSV4 (which uses
+        # ``scoring_func="sqrtsoftplus"`` with a bias).
+        n_routed_experts = router_logits.shape[-1]
+        if scoring_func == "softmax":
+            scores = router_logits.softmax(dim=-1)
+        elif scoring_func == "sigmoid":
+            scores = router_logits.sigmoid()
+        elif scoring_func == "sqrtsoftplus":
+            scores = F.softplus(router_logits).sqrt()
         else:
-            logZ = torch.logsumexp(router_logits, dim=-1, keepdim=True)
-            topk_vals = (topk_logit_vals - logZ).exp()
-        return topk_vals.to(torch.float32), topk_idx.to(torch.int32)
+            raise ValueError(
+                f"Unsupported scoring function on CPU: {scoring_func!r}. "
+                "Expected one of: softmax, sigmoid, sqrtsoftplus."
+            )
+        if e_score_correction_bias is not None:
+            scores_for_choice = scores.view(
+                -1, n_routed_experts
+            ) + e_score_correction_bias.unsqueeze(0)
+        else:
+            scores_for_choice = scores.view(-1, n_routed_experts)
+        topk_idx = torch.topk(
+            scores_for_choice, k=top_k, dim=-1, sorted=False
+        )[1]
+        topk_vals = scores.gather(1, topk_idx)
+        if renormalize:
+            topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
+        topk_vals = topk_vals.to(torch.float32)
+        if routed_scaling_factor != 1.0:
+            topk_vals = topk_vals * routed_scaling_factor
+        return topk_vals, topk_idx.to(torch.int32)
     else:
         return custom_routing_function(
             hidden_states=hidden_states,

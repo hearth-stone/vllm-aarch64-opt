@@ -242,3 +242,175 @@ def test_cpu_sparse_attn_prefill_basic_with_attn_sink():
     expected = torch.softmax(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), dim=-1)
     expected = expected @ torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     torch.testing.assert_close(output[0].float(), expected, atol=1e-2, rtol=1e-2)
+
+
+def test_cpu_q_kv_rmsnorm_matches_native_rmsnorm(default_vllm_config):
+    """CPU q/kv RMSNorm should match RMSNorm.forward_native."""
+    del default_vllm_config
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.models.deepseek_v4.cpu import cpu_q_kv_rmsnorm
+
+    torch.manual_seed(2)
+    num_tokens = 5
+    q_lora_rank = 64
+    kv_lora_rank = 24
+    rope = 8
+
+    qr = torch.randn(num_tokens, q_lora_rank, dtype=torch.bfloat16)
+    kv = torch.randn(num_tokens, kv_lora_rank + rope, dtype=torch.bfloat16)
+    q_w = torch.randn(q_lora_rank, dtype=torch.bfloat16)
+    kv_w = torch.randn(kv_lora_rank, dtype=torch.bfloat16)
+
+    qr_norm_mod = RMSNorm(q_lora_rank, eps=1e-6)
+    qr_norm_mod.weight.data.copy_(q_w)
+    kv_norm_mod = RMSNorm(kv_lora_rank, eps=1e-6)
+    kv_norm_mod.weight.data.copy_(kv_w)
+
+    qr_ref = qr_norm_mod.forward_native(qr.clone())
+    kv_c_ref = kv_norm_mod.forward_native(kv[..., :kv_lora_rank].clone())
+
+    qr_out, kv_out = cpu_q_kv_rmsnorm(
+        qr,
+        kv,
+        q_w,
+        kv_w,
+        eps=1e-6,
+        kv_lora_rank=kv_lora_rank,
+    )
+
+    torch.testing.assert_close(qr_out, qr_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        kv_out[..., :kv_lora_rank],
+        kv_c_ref,
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert torch.equal(kv_out[..., kv_lora_rank:], kv[..., kv_lora_rank:])
+
+
+def test_cpu_worker_initializes_workspace_manager():
+    """CPUWorker.init_device should initialize workspace before model runner."""
+    import inspect
+    import re
+
+    from vllm.v1.worker import cpu_worker as cpu_worker_mod
+
+    src = inspect.getsource(cpu_worker_mod.CPUWorker.init_device)
+    code_lines = [
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    ]
+    code = "\n".join(code_lines)
+
+    assert "init_workspace_manager(" in code
+    ws_idx = code.find("init_workspace_manager(")
+    runner_idx = code.find("CPUModelRunner(")
+    assert ws_idx != -1 and runner_idx != -1
+    assert ws_idx < runner_idx
+
+    mod_src = inspect.getsource(cpu_worker_mod)
+    assert re.search(
+        r"from\s+vllm\.v1\.worker\.workspace\s+import\s+[^\n]*init_workspace_manager",
+        mod_src,
+    )
+
+
+def test_unquantized_linear_method_preserves_bmm_weight_on_cpu(monkeypatch):
+    """CPU unquantized GEMM dispatch should skip is_bmm linear layers."""
+    from unittest.mock import patch
+
+    from vllm.model_executor.layers import linear as linear_mod
+
+    monkeypatch.setattr(linear_mod, "current_platform", _FakeCPUPlatform())
+
+    plain = torch.nn.Linear(8, 16, bias=False, dtype=torch.bfloat16)
+    with patch(
+        "vllm.model_executor.layers.utils.dispatch_cpu_unquantized_gemm"
+    ) as mock_dispatch:
+        linear_mod.UnquantizedLinearMethod().process_weights_after_loading(plain)
+    assert mock_dispatch.called
+
+    bmm = torch.nn.Linear(8, 16, bias=False, dtype=torch.bfloat16)
+    bmm.is_bmm = True
+    bmm.bmm_batch_size = 2
+    orig_weight = bmm.weight.detach().clone()
+    with patch(
+        "vllm.model_executor.layers.utils.dispatch_cpu_unquantized_gemm"
+    ) as mock_dispatch:
+        linear_mod.UnquantizedLinearMethod().process_weights_after_loading(bmm)
+    assert not mock_dispatch.called
+    assert torch.equal(bmm.weight.data, orig_weight)
+
+
+def test_cpu_select_experts_supports_dsv4_sqrtsoftplus_with_bias():
+    """CPU select_experts should support DSV4 sqrtsoftplus biased routing."""
+    from torch.nn import functional as F
+
+    from vllm.model_executor.layers.fused_moe.cpu_fused_moe import select_experts
+
+    torch.manual_seed(0)
+    num_tokens = 4
+    num_experts = 8
+    top_k = 2
+    router_logits = torch.randn(num_tokens, num_experts, dtype=torch.float32)
+    e_bias = torch.tensor(
+        [0.5, -1.0, 0.0, 2.0, -0.5, 0.1, 0.0, -2.0],
+        dtype=torch.float32,
+    )
+
+    for scoring_func in ("softmax", "sigmoid", "sqrtsoftplus"):
+        if scoring_func == "softmax":
+            scores = router_logits.softmax(dim=-1)
+        elif scoring_func == "sigmoid":
+            scores = router_logits.sigmoid()
+        else:
+            scores = F.softplus(router_logits).sqrt()
+
+        scores_for_choice = scores + e_bias.unsqueeze(0)
+        expected_idx = torch.topk(
+            scores_for_choice,
+            k=top_k,
+            dim=-1,
+            sorted=False,
+        )[1]
+        expected_vals = scores.gather(1, expected_idx)
+        expected_vals = expected_vals / expected_vals.sum(
+            dim=-1,
+            keepdim=True,
+        )
+        expected_vals = (expected_vals * 2.5).to(torch.float32)
+
+        vals, idx = select_experts(
+            hidden_states=torch.empty(num_tokens, 16),
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=False,
+            renormalize=True,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_bias,
+            routed_scaling_factor=2.5,
+        )
+
+        assert idx.dtype == torch.int32
+        assert vals.dtype == torch.float32
+        assert idx.shape == (num_tokens, top_k)
+        assert vals.shape == (num_tokens, top_k)
+        assert torch.equal(
+            idx.sort(dim=-1).values,
+            expected_idx.to(torch.int32).sort(dim=-1).values,
+        )
+        torch.testing.assert_close(
+            vals.sort(dim=-1).values,
+            expected_vals.sort(dim=-1).values,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    with pytest.raises(ValueError, match="Unsupported scoring function"):
+        select_experts(
+            hidden_states=torch.empty(num_tokens, 16),
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=False,
+            renormalize=True,
+            scoring_func="not_a_real_scoring_func",
+        )
