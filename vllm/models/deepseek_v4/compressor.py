@@ -19,6 +19,10 @@ from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
+from vllm.models.deepseek_v4.cpu import (
+    _cpu_save_partial_states,
+    cpu_kv_compress_norm_rope_insert,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -107,7 +111,9 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         num_reqs = common_attn_metadata.num_reqs
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens)
+        if not current_platform.is_cpu():
+            x = x.pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
         return CompressorMetadata(
@@ -155,6 +161,15 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             raise ValueError(f"Invalid compress ratio: {compress_ratio}")
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if current_platform.is_cpu():
+            return SlidingWindowMLASpec(
+                block_size=self.block_size,
+                num_kv_heads=1,
+                head_size=self.state_dim,
+                dtype=self.dtype,
+                sliding_window=self.sliding_window,
+                alignment=None,
+            )
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
@@ -311,18 +326,29 @@ class DeepseekCompressor(nn.Module):
         # GEMM; state_cache from this kernel) but neither emits/waits on PDL
         # grid dependency primitives, so launch_pdl=True caused a
         # read-after-write race and non-deterministic output.
-        save_partial_states(
-            kv=kv,
-            score=score,
-            ape=self.ape,
-            positions=positions,
-            state_cache=state_cache,
-            slot_mapping=slot_mapping,
-            block_size=block_size,
-            state_width=state_width,
-            compress_ratio=self.compress_ratio,
-            pdl_kwargs=pdl_kwargs,
-        )
+        if current_platform.is_cpu():
+            _cpu_save_partial_states(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                state_cache=state_cache,
+                slot_mapping=slot_mapping,
+                compress_ratio=self.compress_ratio,
+            )
+        else:
+            save_partial_states(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                state_cache=state_cache,
+                slot_mapping=slot_mapping,
+                block_size=block_size,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=pdl_kwargs,
+            )
 
         # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
         # RoPE requirements (kernel applies forward GPT-J style rotation):
@@ -334,6 +360,26 @@ class DeepseekCompressor(nn.Module):
         cos_sin_cache = rotary_emb.cos_sin_cache
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
+
+        if current_platform.is_cpu():
+            cpu_kv_compress_norm_rope_insert(
+                state_cache=state_cache,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                block_size=block_size,
+                rms_norm_weight=self.norm.weight,
+                rms_norm_eps=self.rms_norm_eps,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                kv_slot_mapping=k_cache_metadata.slot_mapping,
+                head_dim=self.head_dim,
+                compress_ratio=self.compress_ratio,
+                overlap=int(self.overlap),
+                rope_head_dim=self.rope_head_dim,
+            )
+            return kv_cache
 
         if current_platform.is_cuda():
             # NVIDIA GPUs.
