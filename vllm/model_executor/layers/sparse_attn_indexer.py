@@ -456,10 +456,29 @@ class SparseAttnIndexer(CustomOp):
             return self.forward_cuda(hidden_states, q_quant, k, weights)
         elif current_platform.is_rocm():
             return self.forward_hip(hidden_states, q_quant, k, weights)
+        elif current_platform.is_cpu():
+            if isinstance(q_quant, tuple):
+                q_values, _ = q_quant
+            else:
+                q_values = q_quant
+            attn_metadata = get_forward_context().attn_metadata
+            if not isinstance(attn_metadata, dict):
+                return self.topk_indices_buffer
+            attn_metadata_narrowed = attn_metadata[self.k_cache.prefix]
+            from vllm.models.deepseek_v4.cpu import cpu_sparse_attn_indexer_op
+
+            return cpu_sparse_attn_indexer_op(
+                q_values,
+                weights,
+                self.k_cache.kv_cache,
+                self.topk_indices_buffer,
+                self.topk_tokens,
+                attn_metadata_narrowed,
+            )
         else:
             raise NotImplementedError(
                 "SparseAttnIndexer native forward is only implemented for "
-                "CUDA, ROCm and XPU platforms."
+                "CUDA, ROCm, XPU and CPU platforms."
             )
 
     def forward_cuda(
