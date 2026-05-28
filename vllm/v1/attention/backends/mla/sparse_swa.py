@@ -73,9 +73,25 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # determines the SWA block size of 64 tokens per block.
         # TODO(yifan): make SWA block size automatically determined and configurable.
         self.block_size = 64
-        assert self.dtype == torch.uint8
+        if current_platform.is_cpu():
+            assert self.dtype in (torch.bfloat16, torch.float16, torch.float32), (
+                f"DeepseekV4SWACache on CPU expects a float dtype, got {self.dtype}"
+            )
+        else:
+            assert self.dtype == torch.uint8
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if current_platform.is_cpu():
+            return SlidingWindowMLASpec(
+                block_size=self.block_size,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=self.dtype,
+                sliding_window=self.window_size,
+                cache_dtype_str=self.cache_config.cache_dtype,
+                alignment=None,
+                model_version=None,
+            )
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -289,7 +305,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens)
+        if not current_platform.is_cpu():
+            x = x.pin_memory()
         token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
         token_to_req_indices.copy_(x, non_blocking=True)
 
@@ -298,20 +316,35 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         if num_decode_tokens > 0:
             self.decode_swa_lens[num_decode_tokens:] = 0
-            _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                self.decode_swa_indices,
-                self.decode_swa_indices.stride(0),
-                self.decode_swa_lens,
-                self.window_size,
-                query_start_loc,
-                seq_lens,
-                token_to_req_indices,
-                is_valid_token,
-                block_table,
-                block_table.stride(0),
-                self.block_size,
-                TRITON_BLOCK_SIZE=1024,
-            )
+            if current_platform.is_cpu():
+                self.decode_swa_indices[:num_decode_tokens, :, :] = -1
+                _cpu_compute_swa_indices_and_lens(
+                    self.decode_swa_indices,
+                    self.decode_swa_lens,
+                    num_decode_tokens,
+                    self.window_size,
+                    self.block_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                )
+            else:
+                _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+                    self.decode_swa_indices,
+                    self.decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    TRITON_BLOCK_SIZE=1024,
+                )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
@@ -370,6 +403,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         if (
             num_decode_tokens == 0
             or current_platform.is_rocm()
+            or current_platform.is_cpu()
             or current_platform.is_xpu()
         ):
             return out
@@ -403,20 +437,95 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             pfx_gather_lens = torch.empty(
                 num_prefills, dtype=torch.int32, device=seq_lens.device
             )
-            _compute_prefill_metadata_kernel[(1,)](
-                pfx_gather_lens,
-                seq_lens,
-                query_start_loc,
-                num_prefills,
-                num_decodes,
-                self.window_size,
-                BLOCK_SIZE=triton.next_power_of_2(num_prefills),
-            )
+            if current_platform.is_cpu():
+                pfx_gather_lens.copy_(
+                    _cpu_compute_prefill_gather_lens(
+                        seq_lens,
+                        query_start_loc,
+                        num_prefills,
+                        num_decodes,
+                        self.window_size,
+                    )
+                )
+            else:
+                _compute_prefill_metadata_kernel[(1,)](
+                    pfx_gather_lens,
+                    seq_lens,
+                    query_start_loc,
+                    num_prefills,
+                    num_decodes,
+                    self.window_size,
+                    BLOCK_SIZE=triton.next_power_of_2(num_prefills),
+                )
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]
             result["prefill_gather_lens"] = pfx_gather_lens
 
         return result
+
+
+def _cpu_compute_prefill_gather_lens(
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_prefills: int,
+    num_decodes: int,
+    window_size: int,
+) -> torch.Tensor:
+    qsl_slice = query_start_loc[num_decodes : num_decodes + num_prefills + 1]
+    seq_lens_slice = seq_lens[num_decodes : num_decodes + num_prefills]
+    query_lens = qsl_slice[1:] - qsl_slice[:-1]
+    prefix_lens = seq_lens_slice - query_lens
+    gather_lens = query_lens + torch.clamp(prefix_lens, max=window_size - 1)
+    return gather_lens.to(torch.int32)
+
+
+def _cpu_compute_swa_indices_and_lens(
+    swa_indices_buf: torch.Tensor,
+    swa_lens_buf: torch.Tensor,
+    num_decode_tokens: int,
+    window_size: int,
+    block_size: int,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    block_table: torch.Tensor,
+) -> None:
+    if num_decode_tokens == 0:
+        return
+
+    device = seq_lens.device
+    offsets = torch.arange(window_size, device=device)
+    token_range = torch.arange(num_decode_tokens, device=device)
+    req_idx = token_to_req_indices[:num_decode_tokens].to(torch.long)
+
+    query_starts = query_start_loc.gather(0, req_idx)
+    query_ends = query_start_loc.gather(0, req_idx + 1)
+    query_lens = query_ends - query_starts
+    prefix_lens = seq_lens.gather(0, req_idx) - query_lens
+
+    pos = prefix_lens + token_range - query_starts
+    start_pos = torch.clamp(pos - window_size + 1, min=0)
+    end_pos = pos + 1
+    swa_len = end_pos - start_pos
+    valid = is_valid_token[:num_decode_tokens]
+    swa_len = torch.where(valid, swa_len, torch.zeros_like(swa_len))
+    swa_lens_buf[:num_decode_tokens] = swa_len.to(torch.int32)
+
+    pos_offset = start_pos.unsqueeze(1) + offsets.unsqueeze(0)
+    block_indices = torch.clamp(pos_offset // block_size, max=block_table.shape[1] - 1)
+    block_numbers = block_table[
+        req_idx.unsqueeze(1).expand(-1, window_size), block_indices
+    ]
+    slot_ids = (block_numbers * block_size + (pos_offset % block_size)).to(
+        torch.int32
+    )
+    slot_ids = torch.where(
+        offsets.unsqueeze(0) < swa_len.unsqueeze(1),
+        slot_ids,
+        torch.full_like(slot_ids, -1),
+    )
+    swa_indices_buf[:num_decode_tokens, 0, :] = slot_ids
 
 
 @triton.jit

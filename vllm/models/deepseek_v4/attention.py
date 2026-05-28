@@ -24,6 +24,12 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
 )
+from vllm.models.deepseek_v4.cpu import (
+    cpu_indexer_q_rope_quant,
+    cpu_inv_rope_einsum,
+    cpu_q_kv_rmsnorm_no_k_pe,
+    cpu_qnorm_rope_kv_rope_insert,
+)
 from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
@@ -75,9 +81,27 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Full MLA pages must be large enough to pad the DeepSeek V4 SWA and compressor
+# state pages, whose physical tensor sharing assumes a 256-token MLA block.
+_DEEPSEEK_V4_MLA_BLOCK_SIZE = 256
+
+
+def _linear_output_to_fp32(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    output = layer(hidden_states)
+    if isinstance(output, tuple):
+        output = output[0]
+    return output.to(torch.float32)
+
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
+    if current_platform.is_cpu():
+        from vllm.models.deepseek_v4.cpu import DeepseekV4CPUSparseMLAImpl
+
+        return DeepseekV4CPUSparseMLAImpl
     if current_platform.is_rocm():
         from vllm.models.deepseek_v4.amd.rocm import (
             DeepseekV4ROCMAiterMLASparseImpl,
@@ -181,23 +205,30 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.kv_norm = mla_modules.kv_norm
         self.wo_a = mla_modules.wo_a
 
-        self._wo_a_act_quant = QuantFP8(
-            static=False,
-            group_shape=GroupShape(1, 128),
-            use_ue8m0=True,
-        )
-        # Bypass packed-for-deepgemm path — we need FP32 scales (not packed
-        # INT32) so fp8_einsum can handle layout transform internally.
-        self._wo_a_act_quant.use_deep_gemm_supported = False
+        if current_platform.is_cpu():
+            self._wo_a_act_quant = None
+        else:
+            self._wo_a_act_quant = QuantFP8(
+                static=False,
+                group_shape=GroupShape(1, 128),
+                use_ue8m0=True,
+            )
+            # Bypass packed-for-deepgemm path — we need FP32 scales (not packed
+            # INT32) so fp8_einsum can handle layout transform internally.
+            self._wo_a_act_quant.use_deep_gemm_supported = False
         self.wo_b = mla_modules.wo_b
 
         # Pick fp8_einsum recipe based on GPU arch:
         # SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128
         # SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1
-        cap = current_platform.get_device_capability()
-        assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-        self._einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
-        self._tma_aligned_scales = cap.major >= 10
+        if current_platform.is_cpu():
+            self._einsum_recipe = (1, 128, 128)
+            self._tma_aligned_scales = False
+        else:
+            cap = current_platform.get_device_capability()
+            assert cap is not None, "DeepseekV4 attention requires a CUDA device"
+            self._einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
+            self._tma_aligned_scales = cap.major >= 10
 
         self.rotary_emb = mla_modules.rotary_emb
         self.indexer_rotary_emb = mla_modules.indexer_rotary_emb
@@ -208,26 +239,33 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Per-head RMS normalization for Q (no learnable weights)
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
 
-        # TODO(yifan): currently hardcoded for FP8 sparse, make it more generic
-        head_bytes = (
-            self.nope_head_dim  # 448 fp8 NoPE
-            + self.rope_head_dim * 2  # 64 bf16 RoPE
-            + self.nope_head_dim // 64  # 7B scale factors
-            + 1  # 1B pad
-        )
+        if current_platform.is_cpu():
+            head_bytes = self.head_dim
+        else:
+            # TODO(yifan): currently hardcoded for FP8 sparse, make it more generic
+            head_bytes = (
+                self.nope_head_dim  # 448 fp8 NoPE
+                + self.rope_head_dim * 2  # 64 bf16 RoPE
+                + self.nope_head_dim // 64  # 7B scale factors
+                + 1  # 1B pad
+            )
 
         # Will be None on ROCm for now.
         self.aux_stream_list = mla_modules.aux_stream_list
         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
-        self.ln_events = [torch.cuda.Event() for _ in range(4)]
+        self.ln_events = (
+            [None for _ in range(4)]
+            if current_platform.is_cpu()
+            else [torch.cuda.Event() for _ in range(4)]
+        )
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
-            dtype=torch.uint8,
+            dtype=torch.bfloat16 if current_platform.is_cpu() else torch.uint8,
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
         )
@@ -251,7 +289,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
             topk_indices_buffer=self.topk_indices_buffer,
         )
-        # Mirror the inner layer's padded head count (single source of truth).
+        # Mirror the inner layer's backend-requested head count.
         self.padded_heads = self.mla_attn.padded_heads
 
         # Register this layer in the compilation config's static forward context
@@ -283,8 +321,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Pre-allocate attention output with FlashMLA-padded head count.
-        # The op writes into `o_padded`; we slice to n_local_heads after.
+        # Pre-allocate attention output with the backend-requested head count.
+        # CPU keeps this at n_local_heads; FlashMLA may request padded heads.
         num_tokens = hidden_states.shape[0]
         o_padded = torch.empty(
             (num_tokens, self.padded_heads, self.head_dim),
@@ -301,9 +339,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        # Keep ROCm on the BF16 reference wo_a path util kernel ready.
-        if current_platform.is_rocm():
-            z = rocm_inv_rope_einsum(
+        # Keep ROCm/CPU on the BF16 reference wo_a path util kernel ready.
+        if current_platform.is_rocm() or current_platform.is_cpu():
+            inv_rope_einsum = (
+                cpu_inv_rope_einsum
+                if current_platform.is_cpu()
+                else rocm_inv_rope_einsum
+            )
+            z = inv_rope_einsum(
                 self.rotary_emb,
                 o,
                 positions,
@@ -363,6 +406,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
+                if current_platform.is_cpu():
+                    return _linear_output_to_fp32(
+                        compressor.fused_wkv_wgate,
+                        hidden_states,
+                    )
                 return torch.mm(
                     hidden_states,
                     compressor.fused_wkv_wgate.weight.T,
@@ -380,6 +428,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
+                if current_platform.is_cpu():
+                    return _linear_output_to_fp32(
+                        indexer.compressor.fused_wkv_wgate,
+                        hidden_states,
+                    )
                 return torch.mm(
                     hidden_states,
                     indexer.compressor.fused_wkv_wgate.weight.T,
@@ -420,13 +473,27 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+        if current_platform.is_cpu():
+            assert self.kv_lora_rank == kv.shape[-1], (
+                "DeepSeek V4 CPU q/kv RMSNorm expects kv without a separate "
+                f"k_pe tail, got kv_lora_rank={self.kv_lora_rank} and "
+                f"kv dim={kv.shape[-1]}"
+            )
+            qr, kv = cpu_q_kv_rmsnorm_no_k_pe(
+                qr,
+                kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
+        else:
+            qr, kv = fused_q_kv_rmsnorm(
+                qr,
+                kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
@@ -490,8 +557,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
-        # MLA attention writes into the pre-allocated `out` buffer
-        # ([num_tokens, padded_heads, head_dim]).
+        # MLA attention writes into the pre-allocated `out` buffer.
         self.mla_attn(q, kv, positions, output=out)
 
     def _fused_qnorm_rope_kv_insert(
@@ -521,7 +587,28 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         assert swa_metadata is not None
 
         swa_kv_cache = self.swa_cache_layer.kv_cache
-        swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+        swa_kv_cache_2d = swa_kv_cache.reshape(-1, swa_kv_cache.shape[-1])
+
+        if current_platform.is_cpu():
+            cpu_qnorm_rope_kv_rope_insert(
+                q,
+                kv,
+                swa_kv_cache_2d,
+                swa_metadata.slot_mapping,
+                positions.to(torch.int64),
+                self.rotary_emb,
+                self.eps,
+                self.kv_lora_rank,
+                self.rope_head_dim,
+                self.nope_head_dim,
+            )
+            if self.n_local_heads < self.padded_heads:
+                return F.pad(
+                    q,
+                    (0, 0, 0, self.padded_heads - self.n_local_heads),
+                    value=0.0,
+                )
+            return q
 
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE,
@@ -647,7 +734,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.prefix = prefix  # Alias for compatibility with compressor
 
         self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.ln_events = (
+            [None, None]
+            if current_platform.is_cpu()
+            else [torch.cuda.Event(), torch.cuda.Event()]
+        )
 
         # Padded Q head count is dictated by the selected impl.
         self.padded_heads = self.impl_cls.get_padded_num_q_heads(num_heads)
@@ -665,20 +756,33 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
-        # DeepseekV4 only supports fp8 kv-cache format for now.
+        # DeepseekV4 uses packed fp8 KV cache on GPU. CPU keeps bf16 cache
+        # rows directly and runs through the torch fallback in the impl.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 only supports fp8 kv-cache format for now, "
-            f"got {kv_cache_dtype}"
-        )
-        assert issubclass(self.get_attn_backend(), FlashMLASparseBackend), (
-            "Only FlashMLA Sparse Attention backend is supported for DeepseekV4 for now"
-        )
+        if current_platform.is_cpu():
+            if not (
+                kv_cache_dtype.startswith("fp8")
+                or kv_cache_dtype in ("auto", "bfloat16", "bf16")
+            ):
+                raise AssertionError(
+                    f"DeepseekV4 on CPU expects bf16 / auto / fp8 KV cache "
+                    f"dtype, got {kv_cache_dtype!r}"
+                )
+        else:
+            assert kv_cache_dtype.startswith("fp8"), (
+                f"DeepseekV4 only supports fp8 kv-cache format for now, "
+                f"got {kv_cache_dtype}"
+            )
+            assert issubclass(self.get_attn_backend(), FlashMLASparseBackend), (
+                "Only FlashMLA Sparse Attention backend is supported for "
+                "DeepseekV4 for now"
+            )
         # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
         # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
         if (
-            issubclass(self.get_attn_backend(), FlashMLASparseBackend)
+            not current_platform.is_cpu()
+            and issubclass(self.get_attn_backend(), FlashMLASparseBackend)
             and kv_cache_dtype.startswith("fp8")
             and kv_cache_dtype != "fp8_ds_mla"
         ):
@@ -706,6 +810,17 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             self.compress_ratio <= 1
         ):  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
+        if current_platform.is_cpu():
+            return MLAAttentionSpec(
+                block_size=_DEEPSEEK_V4_MLA_BLOCK_SIZE,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=torch.bfloat16,
+                compress_ratio=self.compress_ratio,
+                cache_dtype_str=self.kv_cache_dtype,
+                alignment=None,
+                model_version=None,
+            )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -751,6 +866,14 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # head_dim already carries the fp8 scale padding
         # compress_ratio=1 for V3.2, >1 for DeepseekV4; both use the same cache layout.
+        if current_platform.is_cpu():
+            return MLAAttentionSpec(
+                block_size=_DEEPSEEK_V4_MLA_BLOCK_SIZE,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                dtype=self.dtype,
+                compress_ratio=self.compress_ratio,
+            )
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
@@ -834,10 +957,18 @@ class DeepseekV4Indexer(nn.Module):
         # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
         # For FP4 indexer cache, we still allocate the same amount of memory as FP8,
         # but only use the first half of the memory.
-        k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
+        if current_platform.is_cpu():
+            assert not self.use_fp4_kv, "CPU indexer path does not support FP4 cache."
+            k_cache_head_dim = self.head_dim
+            k_cache_dtype = torch.bfloat16
+        else:
+            k_cache_head_dim = (
+                self.head_dim + self.head_dim // self.quant_block_size * 4
+            )
+            k_cache_dtype = torch.uint8
         self.k_cache = DeepseekV4IndexerCache(
             head_dim=k_cache_head_dim,
-            dtype=torch.uint8,
+            dtype=k_cache_dtype,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
             compress_ratio=self.compress_ratio,
@@ -868,10 +999,11 @@ class DeepseekV4Indexer(nn.Module):
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
         self.aux_stream = aux_stream
-        self.ln_events: list[torch.cuda.Event] = [
-            torch.cuda.Event(),
-            torch.cuda.Event(),
-        ]
+        self.ln_events = (
+            [None, None]
+            if current_platform.is_cpu()
+            else [torch.cuda.Event(), torch.cuda.Event()]
+        )
 
     def forward(
         self,
@@ -888,6 +1020,18 @@ class DeepseekV4Indexer(nn.Module):
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
+            if current_platform.is_cpu():
+                assert not self.use_fp4_kv, (
+                    "CPU indexer path does not support FP4 KV cache."
+                )
+                return cpu_indexer_q_rope_quant(
+                    positions,
+                    q,
+                    rotary_emb.cos_sin_cache,
+                    indexer_weights,
+                    self.softmax_scale,
+                    self.n_head**-0.5,
+                )
             return fused_indexer_q_rope_quant(
                 positions,
                 q,

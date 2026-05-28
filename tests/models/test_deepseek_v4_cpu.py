@@ -1,238 +1,244 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU bf16 path smoke tests for DeepSeek V4.
 
-Scope of this first cut:
-
-* ``vllm.model_executor.layers.mhc`` and ``vllm.model_executor.models.deepseek_v4``
-  must import on CPU (no triton / tilelang / deep_gemm / flashmla pulled in).
-* The pure-torch fallback paths in ``mhc.py`` (``mhc_pre`` / ``mhc_post``
-  / ``mhc_fused_post_pre`` / ``hc_head_fused_kernel``) produce numerically
-  consistent results with each other on CPU.
-* The ``DeepseekV4FP8Config`` config / weight-mapper plumbing recognises the
-  ``"w8a8"`` ``expert_dtype`` reserved path.
-
-End-to-end CPU MLA execution is *not* in scope here — the
-``DeepseekV4MultiHeadLatentAttentionWrapper`` is intentionally bound to
-CUDA-only fused kernels and raises ``NotImplementedError`` on CPU.
-"""
-
-from __future__ import annotations
-
-import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm.platforms import current_platform
-
-pytestmark = pytest.mark.skipif(
-    not current_platform.is_cpu(),
-    reason="CPU-only smoke tests for DeepSeek V4 ARM bf16 path.",
-)
+from vllm.models.deepseek_v4.cpu import cpu_sparse_attn_prefill
 
 
-def test_mhc_imports_on_cpu():
-    mhc = importlib.import_module("vllm.model_executor.layers.mhc")
-    # On CPU the tilelang module must be unset and the dispatcher functions
-    # must still be callable Python objects (their ROCm-style torch fallback
-    # path is what runs).
-    assert mhc.tilelang is None, "tilelang should be None on CPU"
-    for name in ("mhc_pre", "mhc_post", "mhc_fused_post_pre", "_hc_head_fused_kernel"):
-        assert callable(getattr(mhc, name)), f"{name} should be a callable"
+class _FakeCPUPlatform:
+    def is_cuda(self):
+        return False
+
+    def is_cpu(self):
+        return True
+
+    def is_rocm(self):
+        return False
 
 
-def test_deepseek_v4_module_imports_on_cpu():
-    mod = importlib.import_module("vllm.model_executor.models.deepseek_v4")
-    # All the public classes the loader uses should resolve.
-    for name in (
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4FP8Config",
-        "_make_deepseek_v4_weights_mapper",
-        "_DEEPSEEK_V4_EXPERT_DTYPES",
-    ):
-        assert hasattr(mod, name), f"deepseek_v4 module missing {name}"
+class _FakeCUDAPlatform:
+    def is_cuda(self):
+        return True
 
-    # On CPU, Mxfp4MoEMethod is bound to None — the FP4 expert path should
-    # not be reachable from the quant config.
-    assert mod.Mxfp4MoEMethod is None
+    def is_cpu(self):
+        return False
+
+    def is_rocm(self):
+        return False
 
 
-def test_w8a8_in_expert_dtype_whitelist():
-    mod = importlib.import_module("vllm.model_executor.models.deepseek_v4")
-    assert "w8a8" in mod._DEEPSEEK_V4_EXPERT_DTYPES
-    assert "fp4" in mod._DEEPSEEK_V4_EXPERT_DTYPES
-    assert "fp8" in mod._DEEPSEEK_V4_EXPERT_DTYPES
+def test_deepseek_v4_aux_streams_are_disabled_on_cpu(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
+
+    def fail_stream():
+        raise AssertionError("CPU path must not create CUDA streams")
+
+    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCPUPlatform())
+    monkeypatch.setattr(nvidia_model.torch.cuda, "Stream", fail_stream)
+
+    assert nvidia_model._make_deepseek_v4_aux_streams() is None
 
 
-def test_w8a8_weights_mapper_remaps_input_scale():
-    mod = importlib.import_module("vllm.model_executor.models.deepseek_v4")
-    mapper = mod._make_deepseek_v4_weights_mapper("w8a8")
-    # The mapper is a WeightsMapper; reach into its regex table to confirm
-    # the w8a8 branch installed both ``.weight_scale`` (passthrough) and
-    # ``.input_scale`` (passthrough) preserving rules for expert keys.
-    keys = [p.pattern for p in mapper.orig_to_new_regex.keys()]
-    assert any("input_scale" in k for k in keys), (
-        f"w8a8 mapper missing .input_scale rule, got {keys}"
-    )
+def test_deepseek_v4_scale_fmt_is_optional_for_bf16_config():
+    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
 
-
-def test_mhc_pre_torch_fallback_runs():
-    # Construct a minimal valid input for mhc_pre on CPU and check that
-    # it runs through the ROCm-shared torch fallback without raising.
-    mhc = importlib.import_module("vllm.model_executor.layers.mhc")
-
-    hc_mult = 2
-    hidden_size = 32  # divisible by 32 (mhc kernels assume multiples of 128
-    # in the GPU path, but the torch fallback only requires shapes match).
-    num_tokens = 4
-    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
-
-    residual = torch.randn(num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16)
-    fn = torch.randn(hc_mult3, hc_mult * hidden_size, dtype=torch.float32)
-    hc_scale = torch.randn(3, dtype=torch.float32)
-    hc_base = torch.randn(hc_mult3, dtype=torch.float32)
-
-    post_mix, comb_mix, layer_input = mhc.mhc_pre(
-        residual,
-        fn,
-        hc_scale,
-        hc_base,
-        rms_eps=1e-6,
-        hc_pre_eps=1e-3,
-        hc_sinkhorn_eps=1e-3,
-        hc_post_mult_value=2.0,
-        sinkhorn_repeat=1,
-    )
-
-    assert post_mix.shape == (num_tokens, hc_mult, 1)
-    assert comb_mix.shape == (num_tokens, hc_mult, hc_mult)
-    assert layer_input.shape == (num_tokens, hidden_size)
-    assert layer_input.dtype == torch.bfloat16
-
-
-def test_mhc_post_torch_fallback_runs():
-    mhc = importlib.import_module("vllm.model_executor.layers.mhc")
-    hc_mult = 2
-    hidden_size = 16
-    num_tokens = 3
-
-    x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16)
-    residual = torch.randn(
-        num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16
-    )
-    post_layer_mix = torch.randn(num_tokens, hc_mult, 1, dtype=torch.float32)
-    comb_res_mix = torch.randn(num_tokens, hc_mult, hc_mult, dtype=torch.float32)
-
-    out = mhc.mhc_post(x, residual, post_layer_mix, comb_res_mix)
-    assert out.shape == residual.shape
-    assert out.dtype == torch.bfloat16
-
-
-def test_mhc_fused_post_pre_composes_post_then_pre():
-    # CPU fallback for ``mhc_fused_post_pre`` should equal ``mhc_post``
-    # followed by ``mhc_pre`` on the resulting residual (we just use the
-    # same inputs and check no exceptions; numerical equivalence is by
-    # construction since the CPU path literally calls the two reference
-    # impls in sequence).
-    mhc = importlib.import_module("vllm.model_executor.layers.mhc")
-
-    hc_mult = 2
-    hidden_size = 32
-    num_tokens = 4
-    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
-
-    x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16)
-    residual = torch.randn(
-        num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16
-    )
-    post_layer_mix = torch.randn(num_tokens, hc_mult, 1, dtype=torch.float32)
-    comb_res_mix = torch.randn(num_tokens, hc_mult, hc_mult, dtype=torch.float32)
-    fn = torch.randn(hc_mult3, hc_mult * hidden_size, dtype=torch.float32)
-    hc_scale = torch.randn(3, dtype=torch.float32)
-    hc_base = torch.randn(hc_mult3, dtype=torch.float32)
-
-    residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = (
-        mhc.mhc_fused_post_pre(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps=1e-6,
-            hc_pre_eps=1e-3,
-            hc_sinkhorn_eps=1e-3,
-            hc_post_mult_value=2.0,
-            sinkhorn_repeat=1,
+    assert nvidia_model._get_deepseek_v4_scale_fmt(SimpleNamespace()) is None
+    assert (
+        nvidia_model._get_deepseek_v4_scale_fmt(
+            SimpleNamespace(quantization_config={"scale_fmt": "ue8m0"})
         )
+        == "ue8m0"
     )
 
-    assert residual_cur.shape == residual.shape
-    assert residual_cur.dtype == torch.bfloat16
-    assert post_mix_cur.shape == (num_tokens, hc_mult, 1)
-    assert comb_mix_cur.shape == (num_tokens, hc_mult, hc_mult)
-    assert layer_input_cur.shape == (num_tokens, hidden_size)
-    assert layer_input_cur.dtype == torch.bfloat16
+
+def test_deepseek_v4_decoder_uses_native_forward_off_cuda(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
+
+    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCPUPlatform())
+    assert nvidia_model._use_deepseek_v4_native_decoder_forward()
+
+    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCUDAPlatform())
+    assert not nvidia_model._use_deepseek_v4_native_decoder_forward()
 
 
-def test_hc_head_fused_kernel_torch_fallback():
-    mhc = importlib.import_module("vllm.model_executor.layers.mhc")
+def test_deepseek_v4_sparse_impl_uses_cpu_fallback(monkeypatch):
+    from vllm.models.deepseek_v4 import attention as deepseek_attention
+    from vllm.models.deepseek_v4.cpu import DeepseekV4CPUSparseMLAImpl
 
-    hc_mult = 2
-    hidden_size = 32
-    num_tokens = 5
+    monkeypatch.setattr(deepseek_attention, "current_platform", _FakeCPUPlatform())
 
-    hs_flat = torch.randn(num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16)
-    fn = torch.randn(hc_mult, hc_mult * hidden_size, dtype=torch.float32)
-    hc_scale = torch.randn(1, dtype=torch.float32)
-    hc_base = torch.randn(hc_mult, dtype=torch.float32)
-    out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16)
+    impl_cls = deepseek_attention._select_v4_sparse_impl()
 
-    mhc._hc_head_fused_kernel(
-        hs_flat,
-        fn,
-        hc_scale,
-        hc_base,
-        out,
-        hidden_size,
-        rms_eps=1e-6,
-        hc_eps=1e-3,
-        hc_mult=hc_mult,
+    assert impl_cls is DeepseekV4CPUSparseMLAImpl
+    assert impl_cls.backend_cls.get_supported_head_sizes() == [512]
+
+
+def test_deepseek_v4_cpu_linear_output_uses_module_forward_with_empty_weight():
+    from vllm.models.deepseek_v4.attention import _linear_output_to_fp32
+
+    class CPUDispatchedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+            self.dispatch_weight = torch.randn((3, 4), dtype=torch.bfloat16)
+
+        def forward(self, hidden_states):
+            return torch.nn.functional.linear(hidden_states, self.dispatch_weight)
+
+    layer = CPUDispatchedLinear()
+    hidden_states = torch.randn((2, 4), dtype=torch.bfloat16)
+
+    output = _linear_output_to_fp32(layer, hidden_states)
+
+    expected = torch.nn.functional.linear(
+        hidden_states,
+        layer.dispatch_weight,
+    ).to(torch.float32)
+    assert output.dtype is torch.float32
+    torch.testing.assert_close(output, expected)
+
+
+def test_deepseek_v4_cpu_mla_block_size_can_group_swa_pages():
+    from vllm.models.deepseek_v4.attention import _DEEPSEEK_V4_MLA_BLOCK_SIZE
+    from vllm.v1.core.kv_cache_utils import _get_kv_cache_groups_uniform_groups
+    from vllm.v1.kv_cache_interface import (
+        MLAAttentionSpec,
+        SlidingWindowMLASpec,
+        UniformTypeKVCacheSpecs,
     )
-    assert out.shape == (num_tokens, hidden_size)
-    assert out.dtype == torch.bfloat16
-    # Output should not be all-zeros (the kernel should have written
-    # something) for non-degenerate inputs.
-    assert torch.isfinite(out).all()
 
-
-def test_mla_wrapper_raises_on_cpu():
-    """The DeepseekV4 MLA wrapper currently has no CPU implementation; it
-    must raise a clear NotImplementedError that points users at the
-    follow-up work needed to add torch reference impls."""
-    from vllm.model_executor.layers.deepseek_v4_attention import (
-        DeepseekV4MultiHeadLatentAttentionWrapper,
+    full_mla_spec = MLAAttentionSpec(
+        block_size=_DEEPSEEK_V4_MLA_BLOCK_SIZE,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+    )
+    default_block_mla_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+    )
+    swa_spec = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=4096,
+    )
+    compressor_state_spec = SlidingWindowMLASpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=2048,
+        dtype=torch.float32,
+        sliding_window=4096,
     )
 
-    with pytest.raises(NotImplementedError, match="CPU implementation"):
-        # Pass enough kwargs for super().__init__() then trip the CPU
-        # guard before any GPU-specific module access. The arguments here
-        # are placeholders; the guard lives at the very top of __init__
-        # immediately after super().__init__().
-        DeepseekV4MultiHeadLatentAttentionWrapper(
-            hidden_size=32,
-            num_heads=4,
-            head_dim=16,
-            scale=1.0,
-            qk_nope_head_dim=8,
-            qk_rope_head_dim=8,
-            v_head_dim=16,
-            q_lora_rank=8,
-            kv_lora_rank=8,
-            o_lora_rank=8,
-            mla_modules=None,  # type: ignore[arg-type]  # never read
-            window_size=16,
-            compress_ratio=1,
-        )
+    assert default_block_mla_spec.page_size_bytes < swa_spec.page_size_bytes
+    assert swa_spec.page_size_bytes <= full_mla_spec.page_size_bytes
+    assert compressor_state_spec.page_size_bytes <= full_mla_spec.page_size_bytes
+
+    grouped_specs = [
+        UniformTypeKVCacheSpecs.from_specs({"full": full_mla_spec}),
+        UniformTypeKVCacheSpecs.from_specs({"swa": swa_spec}),
+        UniformTypeKVCacheSpecs.from_specs({"compressor": compressor_state_spec}),
+    ]
+    assert all(spec is not None for spec in grouped_specs)
+
+    groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+
+    assert [group.layer_names for group in groups] == [
+        ["full"],
+        ["swa"],
+        ["compressor"],
+    ]
+
+
+def test_deepseek_v4_cpu_sparse_impl_dummy_forward_zeroes_output(monkeypatch):
+    from vllm.models.deepseek_v4 import cpu as deepseek_cpu
+
+    monkeypatch.setattr(
+        deepseek_cpu,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=None),
+    )
+
+    q = torch.ones((2, 3, 4), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+
+    deepseek_cpu.DeepseekV4CPUSparseMLAImpl.forward_mqa(
+        SimpleNamespace(),
+        q,
+        q,
+        torch.arange(q.shape[0]),
+        output,
+    )
+
+    assert torch.count_nonzero(output) == 0
+
+
+def test_deepseek_v4_mega_moe_is_rejected_on_cpu(monkeypatch):
+    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
+
+    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCPUPlatform())
+
+    with pytest.raises(NotImplementedError, match="CUDA-only"):
+        nvidia_model._check_deepseek_v4_mega_moe_supported(True)
+
+    nvidia_model._check_deepseek_v4_mega_moe_supported(False)
+
+
+def test_deepseek_v4_quant_config_uses_unquantized_moe_on_cpu(monkeypatch):
+    from vllm.models.deepseek_v4 import quant_config as deepseek_quant_config
+
+    class DummyFusedMoE:
+        moe_config = object()
+
+    class DummyMoEMethod:
+        def __init__(self, moe_config):
+            self.moe_config = moe_config
+
+    monkeypatch.setattr(deepseek_quant_config, "current_platform", _FakeCPUPlatform())
+    monkeypatch.setattr(deepseek_quant_config, "FusedMoE", DummyFusedMoE)
+    monkeypatch.setattr(
+        deepseek_quant_config, "UnquantizedFusedMoEMethod", DummyMoEMethod
+    )
+    monkeypatch.setattr(deepseek_quant_config, "is_layer_skipped", lambda **_: False)
+
+    config = deepseek_quant_config.DeepseekV4FP8Config()
+    layer = DummyFusedMoE()
+
+    method = config.get_quant_method(layer, "model.layers.0.mlp.experts")
+
+    assert isinstance(method, DummyMoEMethod)
+    assert method.moe_config is layer.moe_config
+    assert not config.is_mxfp4_quant("model.layers.0.mlp.experts", layer)
+
+
+def test_cpu_sparse_attn_prefill_basic_with_attn_sink():
+    q = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.bfloat16)
+    kv = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]], dtype=torch.bfloat16)
+    indices = torch.tensor([[[0, 1, -1]]], dtype=torch.int32)
+    attn_sink = torch.tensor([-1000.0, -1000.0], dtype=torch.float32)
+    output = torch.empty_like(q)
+
+    cpu_sparse_attn_prefill(
+        q=q,
+        kv=kv,
+        indices=indices,
+        topk_length=None,
+        scale=1.0,
+        head_dim=2,
+        attn_sink=attn_sink,
+        output=output,
+    )
+
+    expected = torch.softmax(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), dim=-1)
+    expected = expected @ torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    torch.testing.assert_close(output[0].float(), expected, atol=1e-2, rtol=1e-2)
