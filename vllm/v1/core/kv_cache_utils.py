@@ -1542,11 +1542,49 @@ def _get_kv_cache_groups_uniform_groups(
     # Additionally, we also pad KV blocks in each SWA layer, to align the page size
     # with the corresponding layer in the full-MLA group.
     all_page_sizes = full_mla_spec.get_page_sizes()
+    # The downstream ``size_to_candidate`` map (line below) pads SWA layers up
+    # to the smallest full-MLA page size that's >= the SWA page. On GPU
+    # FlashMLA arranges things so the largest SWA page already fits within
+    # the largest full-MLA page (because fp8_ds_mla compresses full-MLA pages
+    # via ``storage_block_size * 584`` while the SWA compressor-state cache
+    # stays small). On CPU bf16 there is no FlashMLA layout: full-MLA pages
+    # are computed by the generic ``storage_block_size * head_size *
+    # dtype_size`` formula, while the SWA compressor-state cache is fp32 and
+    # uses ``state_dim = 2 * coff * head_dim`` so it can easily exceed the
+    # full-MLA max (e.g. DSV4-Flash-BF16 C4-state = 32768 B vs main-MLA =
+    # 18432 B). In that case we pad ALL full-MLA layers up to the global
+    # max so ``size_to_candidate`` is well-defined and the
+    # ``min(x for x in all_page_sizes if x >= ps)`` lookup at line below
+    # always succeeds. Wastes some memory but doesn't change correctness:
+    # ``page_size_padded`` is the allocator budget; layers still only write
+    # their real bytes. The full-MLA group's same-count-per-page-size
+    # invariant is preserved because we pad uniformly across the current
+    # max-page-size cohort.
+    swa_global_max = max(
+        (max(g.get_page_sizes()) for g in grouped_specs[1:]),
+        default=0,
+    )
+    if swa_global_max > max(all_page_sizes):
+        full_mla_max = max(all_page_sizes)
+        for layer_name, layer_spec in full_mla_spec.kv_cache_specs.items():
+            if layer_spec.page_size_bytes == full_mla_max:
+                object.__setattr__(
+                    layer_spec, "page_size_padded", swa_global_max
+                )
+        # Recompute now that some full-MLA pages have grown.
+        all_page_sizes = full_mla_spec.get_page_sizes()
+
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
-        assert max(sm_page_sizes) <= max(all_page_sizes)
+        assert max(sm_page_sizes) <= max(all_page_sizes), (
+            f"SWA group max page size {max(sm_page_sizes)} exceeds full-MLA "
+            f"max page size {max(all_page_sizes)} even after CPU-style "
+            f"padding. all_page_sizes={sorted(all_page_sizes)}, "
+            f"sm_page_sizes={sorted(sm_page_sizes)}. This indicates a bug "
+            "in the swa_global_max pre-padding above."
+        )
 
         # Unify page size by padding layers' page_size to the nearest larger page_size.
         # Compute candidate (nearest larger page_size) for each unique page size.

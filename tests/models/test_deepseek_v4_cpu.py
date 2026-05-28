@@ -475,3 +475,100 @@ def test_compressor_fused_wkv_wgate_marked_is_bmm():
 
     src = inspect.getsource(deepseek_compressor.DeepseekCompressor)
     assert "self.fused_wkv_wgate.is_bmm = True" in src
+
+
+def test_kv_cache_groups_pad_full_mla_when_swa_exceeds():
+    """Full-MLA pages should pad up when an SWA MLA page is larger."""
+    from vllm.v1.core.kv_cache_utils import _get_kv_cache_groups_uniform_groups
+    from vllm.v1.kv_cache_interface import (
+        MLAAttentionSpec,
+        SlidingWindowMLASpec,
+        UniformTypeKVCacheSpecs,
+    )
+
+    full_mla_specs = {
+        "layer.0.full": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+        ),
+        "layer.1.full": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+        ),
+    }
+    full_mla_group = UniformTypeKVCacheSpecs.from_specs(full_mla_specs)
+    assert full_mla_group is not None
+    assert max(full_mla_group.get_page_sizes()) == 18432
+
+    swa_specs = {
+        "layer.0.swa": SlidingWindowMLASpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=2048,
+            dtype=torch.float32,
+            sliding_window=8,
+        ),
+    }
+    swa_group = UniformTypeKVCacheSpecs.from_specs(swa_specs)
+    assert swa_group is not None
+    assert max(swa_group.get_page_sizes()) == 32768
+
+    result = _get_kv_cache_groups_uniform_groups([full_mla_group, swa_group])
+
+    assert len(result) >= 2
+    assert {"layer.0.full", "layer.1.full"} <= set(result[0].layer_names)
+    for layer_name in ("layer.0.full", "layer.1.full"):
+        spec = full_mla_specs[layer_name]
+        assert spec.page_size_padded == 32768
+        assert spec.page_size_bytes == 32768
+
+    swa_spec = swa_specs["layer.0.swa"]
+    assert swa_spec.page_size_padded is None or swa_spec.page_size_padded == 32768
+
+
+def test_kv_cache_groups_unchanged_when_swa_fits():
+    """Full-MLA pages should not pad when all SWA pages already fit."""
+    from vllm.v1.core.kv_cache_utils import _get_kv_cache_groups_uniform_groups
+    from vllm.v1.kv_cache_interface import (
+        MLAAttentionSpec,
+        SlidingWindowMLASpec,
+        UniformTypeKVCacheSpecs,
+    )
+
+    full_mla_specs = {
+        "layer.0.full": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+        ),
+        "layer.1.full": MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+        ),
+    }
+    full_mla_group = UniformTypeKVCacheSpecs.from_specs(full_mla_specs)
+    assert full_mla_group is not None
+
+    swa_specs = {
+        "layer.0.swa": SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        ),
+    }
+    swa_group = UniformTypeKVCacheSpecs.from_specs(swa_specs)
+    assert swa_group is not None
+
+    _get_kv_cache_groups_uniform_groups([full_mla_group, swa_group])
+
+    for layer_name in ("layer.0.full", "layer.1.full"):
+        assert full_mla_specs[layer_name].page_size_padded is None
