@@ -264,7 +264,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # prefill.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
-        sm_count = num_compute_units(device.index)
+        sm_count = 0 if current_platform.is_cpu() else num_compute_units(device.index)
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
@@ -477,7 +477,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
 
             # will be adjusted by chunk loop
             prefill_workspace_starts_cpu = torch.zeros(
-                num_prefills, dtype=torch.int32, pin_memory=True
+                num_prefills,
+                dtype=torch.int32,
+                pin_memory=not current_platform.is_cpu(),
             )
             prefill_workspace_starts_cpu[1:] = torch.cumsum(
                 prefill_seq_lens_cpu[:-1], dim=0
@@ -661,19 +663,38 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             "positions is required for C128A metadata build"
         )
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
-        global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
-            cm.positions[:num_total],
-            self.compress_ratio,
-            num_decode_tokens,
-            req_id_per_token,
-            cm.block_table_tensor[:num_decodes],
-            block_size,
-            cm.slot_mapping,
-            self.c128a_global_decode_buffer,
-            self.c128a_decode_lens_buffer,
-            self.c128a_prefill_buffer,
-            max_compressed_tokens=self.c128a_max_compressed,
-        )
+        if current_platform.is_cpu():
+            from vllm.models.deepseek_v4.cpu import cpu_build_c128a_topk_metadata
+
+            global_decode, decode_lens, prefill_local = (
+                cpu_build_c128a_topk_metadata(
+                    cm.positions[:num_total],
+                    self.compress_ratio,
+                    num_decode_tokens,
+                    req_id_per_token,
+                    cm.block_table_tensor[:num_decodes],
+                    block_size,
+                    cm.slot_mapping,
+                    self.c128a_global_decode_buffer,
+                    self.c128a_decode_lens_buffer,
+                    self.c128a_prefill_buffer,
+                    max_compressed_tokens=self.c128a_max_compressed,
+                )
+            )
+        else:
+            global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
+                cm.positions[:num_total],
+                self.compress_ratio,
+                num_decode_tokens,
+                req_id_per_token,
+                cm.block_table_tensor[:num_decodes],
+                block_size,
+                cm.slot_mapping,
+                self.c128a_global_decode_buffer,
+                self.c128a_decode_lens_buffer,
+                self.c128a_prefill_buffer,
+                max_compressed_tokens=self.c128a_max_compressed,
+            )
 
         result: dict[str, torch.Tensor | None] = {}
         if num_decode_tokens > 0:
