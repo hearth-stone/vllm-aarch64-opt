@@ -277,7 +277,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             or not current_platform.is_device_capability_family(100)
         ) and next_n not in self.natively_supported_next_n_fp4
 
-        sm_count = num_compute_units(self.device.index)
+        # ``num_compute_units`` is only implemented on CUDA / ROCm / XPU
+        # platforms; on CPU it raises ``NotImplementedError``. The SM count
+        # is only ever read by the ``get_paged_mqa_logits_metadata`` call
+        # in ``build`` (already gated by ``current_platform.is_cuda()``)
+        # and the ``scheduler_metadata_buffer`` allocation below — both of
+        # which the CPU path skips. Use 0 as a sentinel so the unused
+        # buffer shape stays valid (and any accidental read would surface
+        # as a shape error rather than silently consuming garbage).
+        if current_platform.is_cpu():
+            sm_count = 0
+        else:
+            sm_count = num_compute_units(self.device.index)
         self.num_sms = sm_count
 
         self.offsets_buffer = torch.arange(
@@ -318,9 +329,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         # See: DeepGMM/csrc/apis/attention.hpp
-        self.scheduler_metadata_buffer = torch.empty(
-            (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
-        )
+        # On CPU there is no DeepGEMM scheduler; allocate a tiny
+        # placeholder so the buffer attribute exists for
+        # ``DeepSeekV32IndexerDecodeMetadata.schedule_metadata`` (the field
+        # is never read in the CPU forward path).
+        if current_platform.is_cpu():
+            self.scheduler_metadata_buffer = torch.empty(
+                (1, 2), dtype=torch.int32, device=self.device
+            )
+        else:
+            self.scheduler_metadata_buffer = torch.empty(
+                (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
+            )
 
         # KV compression. Default to 1 for no compression.
         self.compress_ratio = 1
@@ -376,17 +396,45 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if min_decode_len == max_decode_len:
                 # Uniform decode lengths.
                 num_decode_tokens = num_decodes * max_decode_len
-                _prepare_uniform_decode_kernel[(num_decode_tokens,)](
-                    seq_lens,
-                    self.decode_seq_lens_buffer,
-                    block_table,
-                    block_table.stride(0),
-                    self.expanded_block_table_buffer,
-                    self.expanded_block_table_buffer.stride(0),
-                    self.decode_lens_buffer,
-                    max_decode_len,
-                    BLOCK_SIZE=1024,
-                )
+                if current_platform.is_cpu():
+                    # Pure-torch port of ``_prepare_uniform_decode_kernel``:
+                    # for each (req_id, local_idx) pair in row-major order,
+                    # write per_token_seq_len = seq_lens[req_id] -
+                    # max_decode_len + local_idx + 1, copy the block table
+                    # row, and set decode_len=1.
+                    # Vectorized: use broadcasting + repeat_interleave.
+                    req_ids = torch.arange(
+                        num_decodes, device=self.device, dtype=torch.long
+                    ).repeat_interleave(max_decode_len)
+                    local_idx = (
+                        torch.arange(
+                            max_decode_len,
+                            device=self.device,
+                            dtype=torch.int32,
+                        )
+                        .unsqueeze(0)
+                        .expand(num_decodes, max_decode_len)
+                        .reshape(-1)
+                    )
+                    self.decode_seq_lens_buffer[:num_decode_tokens] = (
+                        seq_lens[req_ids] - max_decode_len + local_idx + 1
+                    ).to(torch.int32)
+                    self.expanded_block_table_buffer[:num_decode_tokens] = (
+                        block_table[req_ids]
+                    )
+                    self.decode_lens_buffer[:num_decode_tokens] = 1
+                else:
+                    _prepare_uniform_decode_kernel[(num_decode_tokens,)](
+                        seq_lens,
+                        self.decode_seq_lens_buffer,
+                        block_table,
+                        block_table.stride(0),
+                        self.expanded_block_table_buffer,
+                        self.expanded_block_table_buffer.stride(0),
+                        self.decode_lens_buffer,
+                        max_decode_len,
+                        BLOCK_SIZE=1024,
+                    )
                 self.decode_seq_lens_buffer[num_decode_tokens:] = 0
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
@@ -683,18 +731,58 @@ def build_prefill_chunk_metadata(
     cu_seq_len_ks = torch.empty(output_query_len, dtype=torch.int32, device=device)
     cu_seq_len_ke = torch.empty(output_query_len, dtype=torch.int32, device=device)
 
-    _build_prefill_chunk_metadata_kernel[(num_reqs,)](
-        query_start_loc,
-        uncompressed_seq_lens[start_idx:end_idx],
-        cu_seq_lens,
-        token_to_seq,
-        cu_seq_len_ks,
-        cu_seq_len_ke,
-        qs_start,
-        qs_stop,
-        BLOCK_SIZE=1024,
-        COMPRESS_RATIO=compress_ratio,
-    )
+    if device.type == "cpu":
+        # Pure-torch port of ``_build_prefill_chunk_metadata_kernel``.
+        # For each request r:
+        #   start_pos = uncompressed_seq_len[r] - query_len[r]
+        #   for each query token at absolute position ``query_start[r] + i``
+        #   in [query_slice_start, query_slice_stop):
+        #     out_pos = (query_start[r] + i) - query_slice_start
+        #     cu_seq_len_ks[out_pos] = cu_compressed_seq_lens[r]
+        #     cu_seq_len_ke[out_pos] = cu_compressed_seq_lens[r] + (
+        #         start_pos + 1 + i) // COMPRESS_RATIO
+        #   token_to_seq[cu_compressed_seq_lens[r] + offset] = r for
+        #     offset in [0, compressed_seq_len[r]).
+        qsl_long = query_start_loc.to(torch.long)
+        cu_seq_lens_long = cu_seq_lens.to(torch.long)
+        unc_seq_lens_long = uncompressed_seq_lens[start_idx:end_idx].to(torch.long)
+
+        for r in range(num_reqs):
+            qs = int(qsl_long[r].item())
+            qe = int(qsl_long[r + 1].item())
+            ks = int(cu_seq_lens_long[r].item())
+            ke = int(cu_seq_lens_long[r + 1].item())
+            unc_seq_len = int(unc_seq_lens_long[r].item())
+            query_len = qe - qs
+            if query_len > 0:
+                start_pos = unc_seq_len - query_len
+                abs_pos = torch.arange(qs, qe, dtype=torch.long, device=device)
+                in_window = (abs_pos >= qs_start) & (abs_pos < qs_stop)
+                if in_window.any():
+                    sel_abs_pos = abs_pos[in_window]
+                    out_pos = sel_abs_pos - qs_start
+                    i_local = sel_abs_pos - qs
+                    seq_len_per_token = (start_pos + 1 + i_local) // compress_ratio
+                    cu_seq_len_ks[out_pos] = ks
+                    cu_seq_len_ke[out_pos] = (ks + seq_len_per_token).to(
+                        torch.int32
+                    )
+            compressed_len = ke - ks
+            if compressed_len > 0:
+                token_to_seq[ks:ke] = r
+    else:
+        _build_prefill_chunk_metadata_kernel[(num_reqs,)](
+            query_start_loc,
+            uncompressed_seq_lens[start_idx:end_idx],
+            cu_seq_lens,
+            token_to_seq,
+            cu_seq_len_ks,
+            cu_seq_len_ke,
+            qs_start,
+            qs_stop,
+            BLOCK_SIZE=1024,
+            COMPRESS_RATIO=compress_ratio,
+        )
 
     token_start = query_start_loc_cpu[start_idx].item()
     if query_slice is not None:

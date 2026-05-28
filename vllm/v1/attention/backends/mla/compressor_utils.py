@@ -72,6 +72,48 @@ def get_compressed_slot_mapping(
         )
 
     num_reqs = block_table.shape[0]
+    if query_start_loc.device.type == "cpu":
+        # Pure-torch port of ``_compressed_slot_mapping_kernel``. The kernel
+        # writes ``slot_mapping[query_start_loc[r] + i]`` for every query
+        # token ``i`` in request ``r``, computing a compressed-cache slot
+        # id where applicable and -1 (PAD_ID) otherwise. Vectorize across
+        # tokens via boolean masks instead of a Python per-request loop.
+        if num_reqs > 0 and num_tokens > 0:
+            qsl_cpu = query_start_loc.to(torch.long)
+            sl_cpu = seq_lens.to(torch.long)
+            # ``token_to_req[t]`` = which request token ``t`` belongs to.
+            query_lens = qsl_cpu[1:] - qsl_cpu[:-1]
+            req_ids = torch.repeat_interleave(
+                torch.arange(num_reqs, device=query_start_loc.device), query_lens
+            )
+            actual = req_ids.shape[0]
+            # ``start_pos[r] = seq_len[r] - query_len[r]`` is the absolute
+            # position of the first query token in request ``r``.
+            start_pos = sl_cpu - query_lens
+            # Per-token absolute position within its sequence.
+            token_idx_in_req = (
+                torch.arange(actual, device=query_start_loc.device)
+                - qsl_cpu[req_ids]
+            )
+            pos = start_pos[req_ids] + token_idx_in_req
+
+            is_valid = ((pos + 1) % compress_ratio) == 0
+            pos_after_compress = pos // compress_ratio
+            block_ids = pos_after_compress // block_size
+            block_offset = pos_after_compress % block_size
+            # ``block_table[req, block_id]`` per token; mask invalid entries
+            # to block 0 to avoid OOB before the final ``where``.
+            safe_block_ids = torch.where(
+                is_valid, block_ids, torch.zeros_like(block_ids)
+            )
+            block_numbers = block_table[req_ids, safe_block_ids].to(torch.long)
+            slot_ids = block_numbers * block_size + block_offset
+            slot_ids = torch.where(
+                is_valid, slot_ids, torch.full_like(slot_ids, -1)
+            )
+            slot_mapping[:actual] = slot_ids
+        return slot_mapping
+
     _compressed_slot_mapping_kernel[(num_reqs,)](
         slot_mapping,
         query_start_loc,
