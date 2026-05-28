@@ -449,3 +449,29 @@ def test_cpu_moe_act_fn_silu_does_not_require_vllm_config():
     finally:
         vllm_cfg._current_vllm_config = saved_cfg
         vllm_cfg.get_cached_compilation_config.cache_clear()
+
+
+def test_compressor_kv_score_uses_cpu_linear_output_helper():
+    """Compressor side GEMMs should avoid CPU aten::mm.dtype dispatch."""
+    import inspect
+
+    from vllm.models.deepseek_v4 import attention as deepseek_attention
+
+    wrapper_cls = deepseek_attention.DeepseekV4MultiHeadLatentAttentionWrapper
+    src = inspect.getsource(wrapper_cls.attn_gemm_parallel_execute)
+    code_only = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    assert code_only.count("current_platform.is_cpu()") >= 2
+    assert code_only.count("_linear_output_to_fp32(") >= 2
+
+
+def test_compressor_fused_wkv_wgate_marked_is_bmm():
+    """Compressor fused_wkv_wgate should preserve raw weight on CPU."""
+    import inspect
+
+    from vllm.models.deepseek_v4 import compressor as deepseek_compressor
+
+    src = inspect.getsource(deepseek_compressor.DeepseekCompressor)
+    assert "self.fused_wkv_wgate.is_bmm = True" in src

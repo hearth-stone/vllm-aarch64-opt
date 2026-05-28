@@ -246,6 +246,19 @@ class DeepseekCompressor(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.fused_wkv_wgate",
         )
+        # ``fused_wkv_wgate`` is a weight container: it is never invoked as
+        # a module — ``deepseek_v4_attention.py:compressor_kv_score`` and
+        # ``indexer_compressor_kv_score`` read ``.weight`` directly and run
+        # ``torch.mm(hidden_states, weight.T)`` by hand. On CPU,
+        # ``UnquantizedLinearMethod.process_weights_after_loading`` would
+        # otherwise hand the weight to ``dispatch_cpu_unquantized_gemm``
+        # (utils.py:227) and — on ARM oneDNN / x86 zen / sgl-kernel —
+        # replace ``layer.weight`` with ``Parameter(torch.empty(0))``,
+        # leaving the raw read above to crash on a zero-numel tensor. Reuse
+        # the ``is_bmm`` escape hatch added in M3.2 part 5 (linear.py
+        # ``process_weights_after_loading`` guard) which is precisely the
+        # "do not touch my weight, the consumer reads it directly" flag.
+        self.fused_wkv_wgate.is_bmm = True
         self.norm = RMSNorm(self.head_dim, self.rms_norm_eps)
 
         self.state_cache = CompressorStateCache(
