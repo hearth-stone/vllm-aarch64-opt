@@ -394,6 +394,14 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         Returns all-``None`` when there are no decode tokens this step, so
         ``_forward_decode`` sees a clean sentinel.
+
+        Also returns all-``None`` on ROCm and CPU: both run their own
+        ``_forward_decode`` fallback (``rocm_forward_decode_fallback`` /
+        ``cpu_forward_decode``) that doesn't read ``tile_sched_*`` and
+        doesn't depend on the FlashMLA C++ tile scheduler. ``get_mla_metadata``
+        is a thin wrapper around ``vllm._flashmla_C`` which isn't built on
+        CPU wheels — calling it raises ``RuntimeError: vllm._flashmla_C is
+        not available``.
         """
         out: dict[str, FlashMLASchedMeta | None] = {
             _LAYER_TYPE_SWAONLY: None,
