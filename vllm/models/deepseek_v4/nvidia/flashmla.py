@@ -79,6 +79,8 @@ class DeepseekV4SparseMLAAttentionImpl(SparseMLAAttentionImpl[FlashMLASparseMeta
 class DeepseekV4FlashMLASparseBackend(FlashMLASparseBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if current_platform.is_cpu():
+            return [MultipleOf(16)]
         return [256]
 
     @staticmethod
@@ -104,6 +106,9 @@ class DeepseekV4FlashMLASparseBackend(FlashMLASparseBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         if cache_dtype_str == "fp8_ds_mla":
+            assert not current_platform.is_cpu(), (
+                "fp8_ds_mla KV cache layout is GPU-only for DeepseekV4."
+            )
             # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)

@@ -162,6 +162,18 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # GPU: 256-token pages match FlashMLA's compressor-state co-location
+        # (DeepseekV4IndexerCache.get_kv_cache_spec sets ``alignment=576`` to
+        # pack with FlashMLA). CPU keeps the indexer K cache as a plain bf16
+        # ``[num_blocks, block_size, head_dim]`` tensor (no fp8 scale
+        # padding, no 576B alignment — see DeepseekV4IndexerCache.
+        # get_kv_cache_spec's CPU branch and ``cpu_sparse_attn_indexer_op`` /
+        # ``cpu_indexer_q_rope_quant``), so the only constraint is being a
+        # multiple of the CPU attention backend's 16-token tile to stay
+        # compatible with ``select_common_block_size`` when grouped with
+        # cpu_attn / Compressor / SWA.
+        if current_platform.is_cpu():
+            return [MultipleOf(16)]
         return [256]
 
 
