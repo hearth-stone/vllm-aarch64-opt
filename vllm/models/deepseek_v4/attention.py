@@ -86,16 +86,6 @@ logger = init_logger(__name__)
 _DEEPSEEK_V4_MLA_BLOCK_SIZE = 256
 
 
-def _linear_output_to_fp32(
-    layer: nn.Module,
-    hidden_states: torch.Tensor,
-) -> torch.Tensor:
-    output = layer(hidden_states)
-    if isinstance(output, tuple):
-        output = output[0]
-    return output.to(torch.float32)
-
-
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
     if current_platform.is_cpu():
@@ -406,14 +396,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
+                w = compressor.fused_wkv_wgate.weight.T
                 if current_platform.is_cpu():
-                    return _linear_output_to_fp32(
-                        compressor.fused_wkv_wgate,
-                        hidden_states,
-                    )
+                    return torch.mm(hidden_states, w).to(torch.float32)
                 return torch.mm(
                     hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
+                    w,
                     out_dtype=torch.float32,
                 )
 
@@ -428,14 +416,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
+                w = indexer.compressor.fused_wkv_wgate.weight.T
                 if current_platform.is_cpu():
-                    return _linear_output_to_fp32(
-                        indexer.compressor.fused_wkv_wgate,
-                        hidden_states,
-                    )
+                    return torch.mm(hidden_states, w).to(torch.float32)
                 return torch.mm(
                     hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
+                    w,
                     out_dtype=torch.float32,
                 )
 

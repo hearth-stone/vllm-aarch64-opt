@@ -21,6 +21,9 @@ class _FakeCPUPlatform:
     def is_rocm(self):
         return False
 
+    def is_xpu(self):
+        return False
+
 
 def test_deepseek_v4_sparse_impl_uses_cpu_fallback(monkeypatch):
     from vllm.models.deepseek_v4 import attention as deepseek_attention
@@ -34,29 +37,55 @@ def test_deepseek_v4_sparse_impl_uses_cpu_fallback(monkeypatch):
     assert impl_cls.backend_cls.get_supported_head_sizes() == [512]
 
 
-def test_deepseek_v4_cpu_linear_output_uses_module_forward_with_empty_weight():
-    from vllm.models.deepseek_v4.attention import _linear_output_to_fp32
+def test_deepseek_v4_cpu_compressor_scores_read_raw_weight(monkeypatch):
+    from vllm.models.deepseek_v4 import attention as deepseek_attention
 
-    class CPUDispatchedLinear(torch.nn.Module):
-        def __init__(self):
+    class RawWeightLinear(torch.nn.Module):
+        def __init__(self, weight):
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
-            self.dispatch_weight = torch.randn((3, 4), dtype=torch.bfloat16)
+            self.weight = torch.nn.Parameter(weight, requires_grad=False)
 
         def forward(self, hidden_states):
-            return torch.nn.functional.linear(hidden_states, self.dispatch_weight)
+            raise AssertionError("CPU compressor score path must not call forward")
 
-    layer = CPUDispatchedLinear()
-    hidden_states = torch.randn((2, 4), dtype=torch.bfloat16)
+    class FakeWeightsProj(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states[:, :2].contiguous(), None
 
-    output = _linear_output_to_fp32(layer, hidden_states)
+    hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    compressor_weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    indexer_weight = torch.arange(20, dtype=torch.float32).reshape(5, 4)
 
-    expected = torch.nn.functional.linear(
-        hidden_states,
-        layer.dispatch_weight,
-    ).to(torch.float32)
-    assert output.dtype is torch.float32
-    torch.testing.assert_close(output, expected)
+    wrapper_cls = deepseek_attention.DeepseekV4MultiHeadLatentAttentionWrapper
+    wrapper = wrapper_cls.__new__(wrapper_cls)
+    wrapper.aux_stream_list = None
+    wrapper.ln_events = [None] * 4
+    wrapper.compressor = SimpleNamespace(
+        fused_wkv_wgate=RawWeightLinear(compressor_weight)
+    )
+    wrapper.indexer = SimpleNamespace(
+        weights_proj=FakeWeightsProj(),
+        compressor=SimpleNamespace(fused_wkv_wgate=RawWeightLinear(indexer_weight)),
+    )
+    wrapper.fused_wqa_wkv = lambda x: (torch.empty((x.shape[0], 3)), None)
+
+    monkeypatch.setattr(deepseek_attention, "current_platform", _FakeCPUPlatform())
+
+    _, kv_score, indexer_kv_score, indexer_weights = (
+        wrapper_cls.attn_gemm_parallel_execute(wrapper, hidden_states)
+    )
+
+    assert kv_score.dtype is torch.float32
+    assert indexer_kv_score.dtype is torch.float32
+    torch.testing.assert_close(
+        kv_score,
+        torch.mm(hidden_states, compressor_weight.T).to(torch.float32),
+    )
+    torch.testing.assert_close(
+        indexer_kv_score,
+        torch.mm(hidden_states, indexer_weight.T).to(torch.float32),
+    )
+    torch.testing.assert_close(indexer_weights, hidden_states[:, :2])
 
 
 def test_deepseek_v4_cpu_mla_block_size_can_group_swa_pages():
@@ -138,6 +167,129 @@ def test_deepseek_v4_cpu_sparse_impl_dummy_forward_zeroes_output(monkeypatch):
     )
 
     assert torch.count_nonzero(output) == 0
+
+
+def test_deepseek_v4_decoder_layer_uses_native_forward_on_cpu(monkeypatch):
+    """CPU forward must avoid CUDA-only mhc_fused_post_pre path."""
+    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
+
+    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCPUPlatform())
+    layer = object.__new__(nvidia_model.DeepseekV4DecoderLayer)
+
+    def _forward_native(*args, **kwargs):
+        return "native", None, None, None
+
+    def _forward_cuda(*args, **kwargs):
+        raise AssertionError("CPU forward must not call _forward_cuda")
+
+    layer._forward_native = _forward_native
+    layer._forward_cuda = _forward_cuda
+
+    output, residual, post_mix, res_mix = nvidia_model.DeepseekV4DecoderLayer.forward(
+        layer,
+        torch.empty(1, 1),
+        torch.arange(1),
+        None,
+    )
+
+    assert output == "native"
+    assert residual is None
+    assert post_mix is None
+    assert res_mix is None
+
+
+def test_deepseek_v4_aux_streams_are_disabled_on_cpu():
+    """CPU model init must not create torch.cuda.Stream objects."""
+    import inspect
+
+    from vllm.models.deepseek_v4.amd import model as amd_model
+    from vllm.models.deepseek_v4.amd import mtp as amd_mtp
+    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
+    from vllm.models.deepseek_v4.nvidia import mtp as nvidia_mtp
+
+    sources = [
+        inspect.getsource(nvidia_model),
+        inspect.getsource(nvidia_mtp),
+        inspect.getsource(amd_model),
+        inspect.getsource(amd_mtp),
+    ]
+    for src in sources:
+        code = "\n".join(
+            line for line in src.splitlines() if not line.lstrip().startswith("#")
+        )
+        stream_idx = code.find("torch.cuda.Stream()")
+        cpu_guard_idx = code.find("current_platform.is_cpu()")
+
+        assert stream_idx != -1
+        assert cpu_guard_idx != -1
+        assert cpu_guard_idx < stream_idx
+
+
+def test_deepseek_v4_hc_head_native_matches_torch_reference():
+    """CPU hc_head native path should match the v0.21 torch fallback math."""
+    from vllm.model_executor.layers.mhc import HCHeadOp
+
+    torch.manual_seed(3)
+    batch_size = 2
+    seq_len = 3
+    hc_mult = 2
+    hidden_size = 32
+
+    hidden_states = torch.randn(
+        batch_size,
+        seq_len,
+        hc_mult,
+        hidden_size,
+        dtype=torch.bfloat16,
+    )
+    hc_fn = torch.randn(hc_mult, hc_mult * hidden_size, dtype=torch.float32)
+    hc_scale = torch.randn(1, dtype=torch.float32)
+    hc_base = torch.randn(hc_mult, dtype=torch.float32)
+
+    op = object.__new__(HCHeadOp)
+    actual = op.forward_native(
+        hidden_states,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-3,
+    )
+
+    hs_flat = hidden_states.reshape(-1, hc_mult, hidden_size)
+    x = hs_flat.reshape(-1, hc_mult * hidden_size).to(torch.float32)
+    mixes = torch.matmul(x, hc_fn.t())
+    sqrsum = x.square().sum(dim=-1, keepdim=True)
+    rsqrt = torch.rsqrt(sqrsum / (hc_mult * hidden_size) + 1e-6)
+    pre_mix = torch.sigmoid(mixes * rsqrt * hc_scale[0] + hc_base) + 1e-3
+    expected = torch.sum(
+        pre_mix.unsqueeze(-1) * hs_flat.to(torch.float32),
+        dim=1,
+    ).to(torch.bfloat16)
+    expected = expected.reshape(batch_size, seq_len, hidden_size)
+
+    assert actual.shape == (batch_size, seq_len, hidden_size)
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected)
+
+
+def test_deepseek_v4_hc_head_native_handles_empty_tokens():
+    from vllm.model_executor.layers.mhc import HCHeadOp
+
+    hc_mult = 2
+    hidden_size = 32
+    op = object.__new__(HCHeadOp)
+    actual = op.forward_native(
+        torch.empty(0, hc_mult, hidden_size, dtype=torch.bfloat16),
+        torch.empty(hc_mult, hc_mult * hidden_size, dtype=torch.float32),
+        torch.empty(1, dtype=torch.float32),
+        torch.empty(hc_mult, dtype=torch.float32),
+        rms_norm_eps=1e-6,
+        hc_eps=1e-3,
+    )
+
+    assert actual.shape == (0, hidden_size)
+    assert actual.dtype == torch.bfloat16
 
 
 def test_cpu_sparse_attn_prefill_basic_with_attn_sink():
@@ -374,7 +526,7 @@ def test_cpu_moe_act_fn_silu_does_not_require_vllm_config():
         vllm_cfg.get_cached_compilation_config.cache_clear()
 
 
-def test_compressor_kv_score_uses_cpu_linear_output_helper():
+def test_compressor_kv_score_avoids_mm_dtype_overload_on_cpu():
     """Compressor side GEMMs should avoid CPU aten::mm.dtype dispatch."""
     import inspect
 
@@ -387,7 +539,9 @@ def test_compressor_kv_score_uses_cpu_linear_output_helper():
     )
 
     assert code_only.count("current_platform.is_cpu()") >= 2
-    assert code_only.count("_linear_output_to_fp32(") >= 2
+    assert code_only.count("torch.mm(hidden_states, w).to(torch.float32)") >= 2
+    assert code_only.count("out_dtype=torch.float32") >= 2
+    assert "_linear_output_to_fp32(" not in code_only
 
 
 def test_compressor_fused_wkv_wgate_marked_is_bmm():

@@ -173,10 +173,14 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         )
 
         # Three aux streams shared across all MTP layers, mirroring
-        # DeepseekV4Model. ROCm runs the same work serially for now.
+        # DeepseekV4Model. CPU / ROCm / XPU run the same work serially for now.
         aux_stream_list = (
             None
-            if current_platform.is_rocm()
+            if (
+                current_platform.is_cpu()
+                or current_platform.is_rocm()
+                or current_platform.is_xpu()
+            )
             else [torch.cuda.Stream() for _ in range(3)]
         )
 

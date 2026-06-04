@@ -623,10 +623,15 @@ class DeepseekV4Model(nn.Module):
         # DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
-        # Disable them on ROCm because of hang issues.
+        # Disable them on CPU / ROCm / XPU because of no CUDA stream support,
+        # hang issues, or no overlap.
         aux_stream_list = (
             None
-            if current_platform.is_rocm()
+            if (
+                current_platform.is_cpu()
+                or current_platform.is_rocm()
+                or current_platform.is_xpu()
+            )
             else [torch.cuda.Stream() for _ in range(3)]
         )
 
