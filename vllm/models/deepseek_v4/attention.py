@@ -590,15 +590,16 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         swa_kv_cache_2d = swa_kv_cache.reshape(-1, swa_kv_cache.shape[-1])
 
         if current_platform.is_cpu():
+            cpu_swa_kv_cache_2d = swa_kv_cache.view(-1, self.head_dim)
             cpu_qnorm_rope_kv_rope_insert(
                 q,
                 kv,
-                swa_kv_cache_2d,
+                cpu_swa_kv_cache_2d,
                 swa_metadata.slot_mapping,
                 positions.to(torch.int64),
                 self.rotary_emb,
                 self.eps,
-                self.kv_lora_rank,
+                self.nope_head_dim,
                 self.rope_head_dim,
                 self.nope_head_dim,
             )
