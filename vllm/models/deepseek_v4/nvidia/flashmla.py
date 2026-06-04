@@ -12,6 +12,7 @@ from vllm.models.deepseek_v4.common.ops import (
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
     MultipleOf,

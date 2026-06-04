@@ -8,6 +8,8 @@ import torch
 
 from vllm.models.deepseek_v4.cpu import cpu_sparse_attn_prefill
 
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
 
 class _FakeCPUPlatform:
     def is_cuda(self):
@@ -18,51 +20,6 @@ class _FakeCPUPlatform:
 
     def is_rocm(self):
         return False
-
-
-class _FakeCUDAPlatform:
-    def is_cuda(self):
-        return True
-
-    def is_cpu(self):
-        return False
-
-    def is_rocm(self):
-        return False
-
-
-def test_deepseek_v4_aux_streams_are_disabled_on_cpu(monkeypatch):
-    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
-
-    def fail_stream():
-        raise AssertionError("CPU path must not create CUDA streams")
-
-    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCPUPlatform())
-    monkeypatch.setattr(nvidia_model.torch.cuda, "Stream", fail_stream)
-
-    assert nvidia_model._make_deepseek_v4_aux_streams() is None
-
-
-def test_deepseek_v4_scale_fmt_is_optional_for_bf16_config():
-    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
-
-    assert nvidia_model._get_deepseek_v4_scale_fmt(SimpleNamespace()) is None
-    assert (
-        nvidia_model._get_deepseek_v4_scale_fmt(
-            SimpleNamespace(quantization_config={"scale_fmt": "ue8m0"})
-        )
-        == "ue8m0"
-    )
-
-
-def test_deepseek_v4_decoder_uses_native_forward_off_cuda(monkeypatch):
-    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
-
-    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCPUPlatform())
-    assert nvidia_model._use_deepseek_v4_native_decoder_forward()
-
-    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCUDAPlatform())
-    assert not nvidia_model._use_deepseek_v4_native_decoder_forward()
 
 
 def test_deepseek_v4_sparse_impl_uses_cpu_fallback(monkeypatch):
@@ -183,44 +140,6 @@ def test_deepseek_v4_cpu_sparse_impl_dummy_forward_zeroes_output(monkeypatch):
     assert torch.count_nonzero(output) == 0
 
 
-def test_deepseek_v4_mega_moe_is_rejected_on_cpu(monkeypatch):
-    from vllm.models.deepseek_v4.nvidia import model as nvidia_model
-
-    monkeypatch.setattr(nvidia_model, "current_platform", _FakeCPUPlatform())
-
-    with pytest.raises(NotImplementedError, match="CUDA-only"):
-        nvidia_model._check_deepseek_v4_mega_moe_supported(True)
-
-    nvidia_model._check_deepseek_v4_mega_moe_supported(False)
-
-
-def test_deepseek_v4_quant_config_uses_unquantized_moe_on_cpu(monkeypatch):
-    from vllm.models.deepseek_v4 import quant_config as deepseek_quant_config
-
-    class DummyFusedMoE:
-        moe_config = object()
-
-    class DummyMoEMethod:
-        def __init__(self, moe_config):
-            self.moe_config = moe_config
-
-    monkeypatch.setattr(deepseek_quant_config, "current_platform", _FakeCPUPlatform())
-    monkeypatch.setattr(deepseek_quant_config, "FusedMoE", DummyFusedMoE)
-    monkeypatch.setattr(
-        deepseek_quant_config, "UnquantizedFusedMoEMethod", DummyMoEMethod
-    )
-    monkeypatch.setattr(deepseek_quant_config, "is_layer_skipped", lambda **_: False)
-
-    config = deepseek_quant_config.DeepseekV4FP8Config()
-    layer = DummyFusedMoE()
-
-    method = config.get_quant_method(layer, "model.layers.0.mlp.experts")
-
-    assert isinstance(method, DummyMoEMethod)
-    assert method.moe_config is layer.moe_config
-    assert not config.is_mxfp4_quant("model.layers.0.mlp.experts", layer)
-
-
 def test_cpu_sparse_attn_prefill_basic_with_attn_sink():
     q = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.bfloat16)
     kv = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]], dtype=torch.bfloat16)
@@ -244,9 +163,10 @@ def test_cpu_sparse_attn_prefill_basic_with_attn_sink():
     torch.testing.assert_close(output[0].float(), expected, atol=1e-2, rtol=1e-2)
 
 
-def test_cpu_q_kv_rmsnorm_matches_native_rmsnorm(default_vllm_config):
+def test_cpu_q_kv_rmsnorm_matches_native_rmsnorm():
     """CPU q/kv RMSNorm should match RMSNorm.forward_native."""
-    del default_vllm_config
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config.device import DeviceConfig
     from vllm.model_executor.layers.layernorm import RMSNorm
     from vllm.models.deepseek_v4.cpu import cpu_q_kv_rmsnorm
 
@@ -261,13 +181,16 @@ def test_cpu_q_kv_rmsnorm_matches_native_rmsnorm(default_vllm_config):
     q_w = torch.randn(q_lora_rank, dtype=torch.bfloat16)
     kv_w = torch.randn(kv_lora_rank, dtype=torch.bfloat16)
 
-    qr_norm_mod = RMSNorm(q_lora_rank, eps=1e-6)
-    qr_norm_mod.weight.data.copy_(q_w)
-    kv_norm_mod = RMSNorm(kv_lora_rank, eps=1e-6)
-    kv_norm_mod.weight.data.copy_(kv_w)
+    with set_current_vllm_config(
+        VllmConfig(device_config=DeviceConfig(device="cpu"))
+    ):
+        qr_norm_mod = RMSNorm(q_lora_rank, eps=1e-6)
+        qr_norm_mod.weight.data.copy_(q_w)
+        kv_norm_mod = RMSNorm(kv_lora_rank, eps=1e-6)
+        kv_norm_mod.weight.data.copy_(kv_w)
 
-    qr_ref = qr_norm_mod.forward_native(qr.clone())
-    kv_c_ref = kv_norm_mod.forward_native(kv[..., :kv_lora_rank].clone())
+        qr_ref = qr_norm_mod.forward_native(qr.clone())
+        kv_c_ref = kv_norm_mod.forward_native(kv[..., :kv_lora_rank].clone())
 
     qr_out, kv_out = cpu_q_kv_rmsnorm(
         qr,

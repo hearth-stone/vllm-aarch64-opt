@@ -53,6 +53,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
 
 # ---------------------------------------------------------------------------
 # Source-inspection guard

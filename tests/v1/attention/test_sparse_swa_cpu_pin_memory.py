@@ -39,8 +39,7 @@ import pytest
 
 from vllm.v1.attention.backends.mla import sparse_swa
 
-
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
 def _build_method_source() -> str:

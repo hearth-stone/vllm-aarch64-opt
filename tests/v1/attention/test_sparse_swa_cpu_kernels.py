@@ -41,8 +41,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     _cpu_compute_swa_indices_and_lens,
 )
 
-
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
 # ---------------------------------------------------------------------------

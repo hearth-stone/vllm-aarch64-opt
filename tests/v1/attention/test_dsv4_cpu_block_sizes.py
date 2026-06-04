@@ -33,17 +33,16 @@ from __future__ import annotations
 
 import pytest
 
-from vllm.v1.attention.backend import MultipleOf
-from vllm.v1.attention.backends.cpu_attn import CPUAttentionBackend
 from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLASparseBackend,
 )
+from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backends.cpu_attn import CPUAttentionBackend
 from vllm.v1.attention.backends.mla.indexer import DeepseekV4IndexerBackend
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
 from vllm.v1.worker.utils import select_common_block_size
 
-
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
 def _force_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

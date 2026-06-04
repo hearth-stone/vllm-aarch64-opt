@@ -54,6 +54,8 @@ import torch
 
 from vllm.models.deepseek_v4 import cpu as cpu_mod
 
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
