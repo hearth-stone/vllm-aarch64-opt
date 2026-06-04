@@ -312,10 +312,13 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-allocate attention output with the backend-requested head count.
-        # CPU keeps this at n_local_heads; FlashMLA may request padded heads.
+        # CPU uses the real head count; FlashMLA may request padded heads.
         num_tokens = hidden_states.shape[0]
-        o_padded = torch.empty(
-            (num_tokens, self.padded_heads, self.head_dim),
+        output_heads = (
+            self.n_local_heads if current_platform.is_cpu() else self.padded_heads
+        )
+        o_buffer = torch.empty(
+            (num_tokens, output_heads, self.head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
@@ -324,10 +327,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         torch.ops.vllm.deepseek_v4_attention(
             hidden_states,
             positions,
-            o_padded,
+            o_buffer,
             self.layer_name,
         )
-        o = o_padded[:, : self.n_local_heads, :]
+        o = (
+            o_buffer
+            if output_heads == self.n_local_heads
+            else o_buffer[:, : self.n_local_heads, :]
+        )
 
         # Keep ROCm/CPU on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm() or current_platform.is_cpu():
@@ -380,6 +387,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         return self.wo_b(z.flatten(1))
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
+        # TODO: 在cpu上融合为一个算子实现
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
             assert len(aux_streams) >= 3
@@ -449,7 +457,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place
+        out: torch.Tensor,  # [num_tokens, output_heads, head_dim], written in place
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -556,6 +564,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         ),
     ) -> torch.Tensor:
         if not isinstance(attn_metadata, dict):
+            if current_platform.is_cpu():
+                return q
             # Profile run: kernel doesn't fire; produce a padded tensor so
             # downstream FlashMLA gets the right shape.
             if self.n_local_heads < self.padded_heads:
@@ -589,12 +599,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.rope_head_dim,
                 self.nope_head_dim,
             )
-            if self.n_local_heads < self.padded_heads:
-                return F.pad(
-                    q,
-                    (0, 0, 0, self.padded_heads - self.n_local_heads),
-                    value=0.0,
-                )
             return q
 
         # Horizontally fused:

@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 import torch.nn.functional as F
 
+from vllm import ir
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseBackend
@@ -94,6 +95,7 @@ def _rmsnorm_native(
     The reduction is done in fp32 for numerical stability and the result is
     cast back to ``x.dtype`` so downstream bf16 GEMMs see the expected dtype.
     """
+    # TODO(zhangxu): 实现一个更高性能的版本
     orig_dtype = x.dtype
     x_f = x.to(torch.float32)
     var = x_f.pow(2).mean(-1, keepdim=True)
@@ -154,8 +156,8 @@ def cpu_q_kv_rmsnorm_no_k_pe(
     independently with their own learned RMSNorm weights.
     """
     return (
-        _rmsnorm_native(qr, q_weight, eps),
-        _rmsnorm_native(kv, kv_weight, eps),
+        ir.ops.rms_norm(qr, q_weight, eps),
+        ir.ops.rms_norm(kv, kv_weight, eps),
     )
 
 
