@@ -50,6 +50,10 @@ if TYPE_CHECKING:
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
+    VLLM_CPU_FUSED_CPP_STRICT: bool = False
+    VLLM_CPU_MOE_PREPACKED_DIR: str | None = None
+    VLLM_CPU_MOE_PREPACK_EXPORT_DIR: str | None = None
+    VLLM_CPU_MOE_PREPACK_PREFAULT: bool = False
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
@@ -874,6 +878,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (CPU backend only) CPU core ids bound by OpenMP threads, e.g., "0-31",
     # "0,1,2", "0-31,33". CPU cores of different ranks are separated by '|'.
     "VLLM_CPU_OMP_THREADS_BIND": lambda: os.getenv("VLLM_CPU_OMP_THREADS_BIND", "auto"),
+    # (Arm CPU backend only) require every DeepSeek V4 fused_cpp target path
+    # to be available instead of silently selecting an upstream fallback.
+    "VLLM_CPU_FUSED_CPP_STRICT": lambda: bool(
+        int(os.getenv("VLLM_CPU_FUSED_CPP_STRICT", "0"))
+    ),
+    "VLLM_CPU_MOE_PREPACKED_DIR": lambda: os.getenv(
+        "VLLM_CPU_MOE_PREPACKED_DIR"
+    ),
+    "VLLM_CPU_MOE_PREPACK_EXPORT_DIR": lambda: os.getenv(
+        "VLLM_CPU_MOE_PREPACK_EXPORT_DIR"
+    ),
+    "VLLM_CPU_MOE_PREPACK_PREFAULT": lambda: bool(
+        int(os.getenv("VLLM_CPU_MOE_PREPACK_PREFAULT", "0"))
+    ),
     # (CPU backend only) CPU cores not used by OMP threads .
     # Those CPU cores will not be used by OMP threads of a rank.
     "VLLM_CPU_NUM_OF_RESERVED_CPU": lambda: (
@@ -2290,6 +2308,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_MOE_PREPACK",
+        "VLLM_CPU_MOE_PREPACKED_DIR",
+        "VLLM_CPU_MOE_PREPACK_EXPORT_DIR",
+        "VLLM_CPU_MOE_PREPACK_PREFAULT",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",
         "VLLM_TEST_FORCE_LOAD_FORMAT",
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
