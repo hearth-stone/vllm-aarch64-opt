@@ -85,6 +85,12 @@ class CpuPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
     ) -> str:
+        if attn_selector_config.use_sparse and attn_selector_config.use_mla:
+            if selected_backend and (
+                selected_backend != AttentionBackendEnum.CPU_MLA_SPARSE_DSV4
+            ):
+                logger.info("Cannot use %s backend on CPU.", selected_backend)
+            return AttentionBackendEnum.CPU_MLA_SPARSE_DSV4.get_path()
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on CPU.")
         if attn_selector_config.use_mla:
@@ -134,10 +140,28 @@ class CpuPlatform(Platform):
         # (see csrc/cpu/mla_decode.cpp). If the model uses MLA we override
         # the default block size regardless of user preference to avoid a
         # runtime kernel dispatch failure.
-        cpu_mla_enabled = model_config is not None and getattr(
-            model_config, "use_mla", False
+        is_deepseek_v4 = bool(
+            model_config is not None
+            and getattr(getattr(model_config, "hf_config", None), "model_type", "")
+            == "deepseek_v4"
         )
-        if cpu_mla_enabled:
+        cpu_mla_enabled = (
+            model_config is not None
+            and getattr(model_config, "use_mla", False)
+            and not is_deepseek_v4
+        )
+        if is_deepseek_v4:
+            if (
+                cache_config.user_specified_block_size
+                and cache_config.block_size != 256
+            ):
+                logger.warning(
+                    "DeepSeek V4 CPU sparse MLA requires block_size=256, "
+                    "overriding user-specified block_size=%s.",
+                    cache_config.block_size,
+                )
+            cache_config.block_size = 256
+        elif cpu_mla_enabled:
             if cache_config.user_specified_block_size and cache_config.block_size != 16:
                 logger.warning(
                     "CPU MLA backend requires block_size=16, overriding "

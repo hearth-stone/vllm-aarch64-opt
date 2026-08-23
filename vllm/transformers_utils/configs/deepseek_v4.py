@@ -16,6 +16,8 @@ class DeepseekV4Config(PretrainedConfig):
         rope_theta: float = 10000.0,
         **kwargs,
     ):
+        if "sliding_window" not in kwargs and "sliding_window_size" in kwargs:
+            kwargs["sliding_window"] = kwargs["sliding_window_size"]
         self.max_position_embeddings = max_position_embeddings
         self.rope_scaling = rope_scaling
         self.rope_theta = rope_theta
