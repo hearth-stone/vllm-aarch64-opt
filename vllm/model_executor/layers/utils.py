@@ -266,10 +266,113 @@ def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     return k % 32 == 0 and n % 16 == 0
 
 
+def _cpu_fused_cpp_linear_required(layer: torch.nn.Module) -> bool:
+    """Whether ``layer`` is an explicitly required fused_cpp linear.
+
+    The marker is deliberately opt-in.  DeepSeek V4's CPU implementation sets
+    it only on projections covered by the fused execution contract; unrelated
+    CPU models retain the upstream SGL/oneDNN/Torch selection order.
+    """
+
+    return bool(getattr(layer, "_cpu_fused_cpp_linear_required", False))
+
+
+def _try_dispatch_fused_cpp_bf16_linear(
+    layer: torch.nn.Module,
+    remove_weight: bool,
+) -> bool:
+    required = _cpu_fused_cpp_linear_required(layer)
+    requested = required or bool(
+        getattr(layer, "_cpu_fused_cpp_linear_enabled", False)
+    )
+
+    def fail(reason: str, exc: Exception | None = None) -> bool:
+        if required:
+            error = RuntimeError(
+                "This CPU linear is marked as requiring fused_cpp bf16_linear, "
+                f"but {reason}."
+            )
+            if exc is not None:
+                raise error from exc
+            raise error
+        logger.debug_once("Skipping fused_cpp bf16_linear: %s.", reason)
+        return False
+
+    # Only explicitly marked Arm CPU linears enter this dispatch.  In
+    # particular, grouped WO_A weights use the DeepSeek V4 output-stage API
+    # instead of the generic linear kernel.
+    if not requested:
+        return False
+    if current_platform.get_cpu_architecture() != CpuArchEnum.ARM:
+        return fail("the current CPU is not Arm")
+    if getattr(layer, "is_bmm", False):
+        return fail("batched/grouped GEMM weights use a different backend")
+    if layer.weight.dtype != torch.bfloat16:
+        return fail(f"the weight dtype is {layer.weight.dtype}")
+
+    bias = getattr(layer, "bias", None)
+    if bias is not None and bias.dtype != torch.bfloat16:
+        return fail(f"the bias dtype is {bias.dtype}")
+
+    try:
+        from fused_cpp import bf16_linear
+    except (ImportError, AttributeError) as exc:
+        return fail("fused_cpp could not be imported", exc)
+
+    if not getattr(bf16_linear, "_supports_bf16_linear", False):
+        return fail("the fused_cpp C++ backend is unavailable")
+
+    try:
+        prepared_weight = bf16_linear.prepare(layer.weight.detach())
+    except (RuntimeError, TypeError, ValueError) as exc:
+        return fail("weight preparation failed", exc)
+
+    out_dtype = getattr(layer, "_cpu_fused_cpp_out_dtype", torch.bfloat16)
+    if out_dtype not in (torch.bfloat16, torch.float32):
+        return fail(f"the requested output dtype is {out_dtype}")
+    num_threads = torch.get_num_threads()
+
+    def fused_cpp_bf16_linear(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del weight
+        output = bf16_linear.linear(
+            x,
+            prepared_weight,
+            out_dtype=out_dtype,
+            nthreads=num_threads,
+        )
+        if bias is not None:
+            output = output + bias
+        return output
+
+    layer.cpu_linear = fused_cpp_bf16_linear
+    layer._cpu_fused_cpp_prepared_weight = prepared_weight
+    if remove_weight:
+        layer.weight = torch.nn.Parameter(
+            torch.empty(0, dtype=torch.bfloat16), requires_grad=False
+        )
+    logger.info_once(
+        "Using required fused_cpp bf16_linear for a DeepSeek V4 CPU "
+        "projection (nthreads=%d).",
+        num_threads,
+    )
+    return True
+
+
 def dispatch_cpu_unquantized_gemm(
     layer: torch.nn.Module,
     remove_weight: bool,
 ) -> None:
+    # DeepSeek V4's fused input/post stages prepare several projections
+    # together after all checkpoint tensors have loaded.  Individual linear
+    # dispatch may still build a fallback handle, but must retain the source
+    # tensor until that owning attention layer completes joint preparation.
+    if getattr(layer, "_cpu_keep_raw_weight", False):
+        remove_weight = False
+
     # skip for missing layers
     if layer.weight.is_meta:
         layer.cpu_linear = torch.nn.functional.linear
@@ -298,8 +401,15 @@ def dispatch_cpu_unquantized_gemm(
             layer.weight.data = ops.causal_conv1d_weight_pack(unpacked)
         return
 
+    if getattr(layer, "is_bmm", False):
+        layer.cpu_linear = torch.nn.functional.linear
+        return
+
     N, K = layer.weight.size()
     dtype = layer.weight.dtype
+
+    if _try_dispatch_fused_cpp_bf16_linear(layer, remove_weight):
+        return
 
     # Zen CPU path: zentorch_linear_unary with optional eager weight prepacking.
     if current_platform.is_zen_cpu() and hasattr(
