@@ -25,7 +25,7 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     convert_moe_weights_to_flashinfer_trtllm_block_layout,
     swap_w13_to_w31,
 )
-from vllm.platforms import current_platform
+from vllm.platforms import CpuArchEnum, current_platform
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
@@ -40,6 +40,7 @@ class UnquantizedMoeBackend(Enum):
     TRITON = "TRITON"
     BATCHED_TRITON = "BATCHED_TRITON"
     CPU = "CPU"
+    FUSED_CPP_ARM = "fused_cpp Arm Plan V2"
     XPU = "XPU"
     TPU = "TPU"
     OOT = "OOT"
@@ -95,7 +96,15 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
     elif current_platform.is_xpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
     elif current_platform.is_cpu():
-        _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
+        if current_platform.get_cpu_architecture() == CpuArchEnum.ARM:
+            _AVAILABLE_BACKENDS = [
+                UnquantizedMoeBackend.FUSED_CPP_ARM,
+                UnquantizedMoeBackend.CPU,
+            ]
+            if envs.VLLM_CPU_FUSED_CPP_STRICT:
+                _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.FUSED_CPP_ARM]
+        else:
+            _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
     return _AVAILABLE_BACKENDS
 
 
@@ -158,6 +167,13 @@ def backend_to_kernel_cls(
             PowerCPUUnquantizedExperts,
             CPUUnquantizedExperts,
         ]
+
+    elif backend == UnquantizedMoeBackend.FUSED_CPP_ARM:
+        from vllm.model_executor.layers.fused_moe.experts.fused_cpp_cpu_moe import (
+            FusedCppArmExperts,
+        )
+
+        return [FusedCppArmExperts]
 
     else:
         raise ValueError(f"Unknown unquantized MoE backend: {backend.value}")

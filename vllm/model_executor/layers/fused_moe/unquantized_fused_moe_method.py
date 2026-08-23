@@ -163,7 +163,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 routing_tables=layer._expert_routing_tables(),
             )
 
-            if self.unquantized_backend == UnquantizedMoeBackend.CPU:
+            if self.unquantized_backend in (
+                UnquantizedMoeBackend.CPU,
+                UnquantizedMoeBackend.FUSED_CPP_ARM,
+            ):
                 # The CPU experts need the layer itself for the setup that
                 # convert_to_unquantized_kernel_format cannot express, since
                 # it only sees the two weight tensors: padding and prepacking
