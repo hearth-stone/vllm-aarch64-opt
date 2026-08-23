@@ -117,7 +117,7 @@ def test_required_fused_cpp_bf16_linear_prepares_once(monkeypatch):
             return torch.nn.functional.linear(x, prepared).to(out_dtype)
 
     fake_fused_cpp = types.ModuleType("fused_cpp")
-    fake_fused_cpp.bf16_linear = FakeBF16Linear
+    fake_fused_cpp.bf16_linear = FakeBF16Linear  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "fused_cpp", fake_fused_cpp)
     monkeypatch.setattr(
         current_platform, "get_cpu_architecture", lambda: CpuArchEnum.ARM
@@ -143,7 +143,7 @@ def test_required_fused_cpp_bf16_linear_prepares_once(monkeypatch):
 
 def test_required_fused_cpp_bf16_linear_fails_closed(monkeypatch):
     fake_fused_cpp = types.ModuleType("fused_cpp")
-    fake_fused_cpp.bf16_linear = types.SimpleNamespace(
+    fake_fused_cpp.bf16_linear = types.SimpleNamespace(  # type: ignore[attr-defined]
         _supports_bf16_linear=False
     )
     monkeypatch.setitem(sys.modules, "fused_cpp", fake_fused_cpp)

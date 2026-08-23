@@ -76,12 +76,10 @@ def _compressed_prefill_ranges(
     compress_ratio: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build fused indexer ranges without per-token Python synchronization."""
-    compressed_lens = torch.div(
-        seq_lens, compress_ratio, rounding_mode="floor"
-    ).to(torch.int32)
-    cu_seq_lens = torch.cat(
-        (compressed_lens.new_zeros(1), compressed_lens.cumsum(0))
+    compressed_lens = torch.div(seq_lens, compress_ratio, rounding_mode="floor").to(
+        torch.int32
     )
+    cu_seq_lens = torch.cat((compressed_lens.new_zeros(1), compressed_lens.cumsum(0)))
     starts = cu_seq_lens[req_ids.to(torch.long)]
     ends = starts + torch.div(
         positions.to(torch.int64) + 1,
@@ -1062,14 +1060,10 @@ class DeepseekV4CPUAttention(nn.Module, AttentionLayerBase):
                 if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
                     output = tensor_model_parallel_all_reduce(output)
                 return output
-        with record_function_or_nullcontext(
-            "vllm::deepseek_v4_attention/output_wo_b"
-        ):
+        with record_function_or_nullcontext("vllm::deepseek_v4_attention/output_wo_b"):
             return _linear(self.wo_b, z_flat)
 
-    def process_weights_after_loading(
-        self, dtype: torch.dtype | None = None
-    ) -> None:
+    def process_weights_after_loading(self, dtype: torch.dtype | None = None) -> None:
         """Prepare joint fused_cpp attention weights after all loads complete."""
 
         del dtype

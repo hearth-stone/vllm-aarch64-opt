@@ -282,9 +282,7 @@ def _try_dispatch_fused_cpp_bf16_linear(
     remove_weight: bool,
 ) -> bool:
     required = _cpu_fused_cpp_linear_required(layer)
-    requested = required or bool(
-        getattr(layer, "_cpu_fused_cpp_linear_enabled", False)
-    )
+    requested = required or bool(getattr(layer, "_cpu_fused_cpp_linear_enabled", False))
 
     def fail(reason: str, exc: Exception | None = None) -> bool:
         if required:

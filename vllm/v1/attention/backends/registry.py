@@ -124,8 +124,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     CPU_ATTN = "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
     CPU_MLA = "vllm.v1.attention.backends.mla.cpu_mla.CPUMLABackend"
     CPU_MLA_SPARSE_DSV4 = (
-        "vllm.models.deepseek_v4.cpu.sparse_mla."
-        "DeepseekV4CPUSparseMLABackend"
+        "vllm.models.deepseek_v4.cpu.sparse_mla.DeepseekV4CPUSparseMLABackend"
     )
     TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
     # Placeholder for third-party/custom backends - must be registered before use

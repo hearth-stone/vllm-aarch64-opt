@@ -18,6 +18,7 @@ from vllm.tracing import instrument
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.workspace import init_workspace_manager
 
 logger = init_logger(__name__)
 
@@ -31,6 +32,10 @@ class CPUModelRunner(GPUModelRunner):
             super().__init__(vllm_config, device)
 
         assert device == torch.device("cpu")
+        # GPUWorker owns this initialization on accelerator platforms, while
+        # the CPU worker constructs CPUModelRunner directly. Modular MoE and
+        # sparse attention share the same workspace API on both platforms.
+        init_workspace_manager(device)
         # Note: speculative decoding is now supported on CPU with C++ native impls
 
         self.use_cuda_graph = False

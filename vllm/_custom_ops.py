@@ -2453,9 +2453,8 @@ def topk_hash_softplus_sqrt(
     hash_indices_table: torch.Tensor | None = None,
     is_padding: torch.Tensor | None = None,
 ) -> None:
-    if (
-        gating_output.device.type == "cpu"
-        and not hasattr(torch.ops._moe_C, "topk_softplus_sqrt")
+    if gating_output.device.type == "cpu" and not hasattr(
+        torch.ops._moe_C, "topk_softplus_sqrt"
     ):
         # The stable MoE extension only builds this operator for CUDA/ROCm.
         # Preserve its exact public semantics for DeepSeek V4 on CPU.
@@ -2491,11 +2490,15 @@ def topk_hash_softplus_sqrt(
         source_rows = torch.arange(
             gating_output.shape[0], dtype=torch.int32, device=gating_output.device
         ).unsqueeze(1)
-        source_rows = source_rows + torch.arange(
-            topk_weights.shape[1],
-            dtype=torch.int32,
-            device=gating_output.device,
-        ).unsqueeze(0) * gating_output.shape[0]
+        source_rows = (
+            source_rows
+            + torch.arange(
+                topk_weights.shape[1],
+                dtype=torch.int32,
+                device=gating_output.device,
+            ).unsqueeze(0)
+            * gating_output.shape[0]
+        )
         token_expert_indices.copy_(source_rows)
         return
     torch.ops._moe_C.topk_softplus_sqrt(

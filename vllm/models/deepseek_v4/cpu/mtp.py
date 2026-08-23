@@ -330,12 +330,12 @@ class DeepSeekV4MTP(nn.Module):
                 )
 
             handled = False
-            for parameter_name, checkpoint_name, shard in stacked:
+            for parameter_name, checkpoint_name, stacked_shard in stacked:
                 if ".experts." in name or checkpoint_name not in name:
                     continue
                 mapped = name.replace(checkpoint_name, parameter_name)
                 parameter = params[mapped]
-                parameter.weight_loader(parameter, loaded_weight, shard)
+                parameter.weight_loader(parameter, loaded_weight, stacked_shard)
                 loaded.add(mapped)
                 handled = True
                 break
@@ -347,7 +347,12 @@ class DeepSeekV4MTP(nn.Module):
                     and loaded_weight.dtype == torch.float8_e8m0fnu
                 ):
                     loaded_weight = loaded_weight.view(torch.uint8)
-                for parameter_name, checkpoint_name, expert_id, shard in expert_mapping:
+                for (
+                    parameter_name,
+                    checkpoint_name,
+                    expert_id,
+                    expert_shard,
+                ) in expert_mapping:
                     if checkpoint_name not in name:
                         continue
                     mapped = name.replace(checkpoint_name, parameter_name)
@@ -358,7 +363,7 @@ class DeepSeekV4MTP(nn.Module):
                         params[mapped],
                         loaded_weight,
                         mapped,
-                        shard_id=shard,
+                        shard_id=expert_shard,
                         expert_id=expert_id,
                         return_success=True,
                     ):
@@ -372,7 +377,10 @@ class DeepSeekV4MTP(nn.Module):
                 continue
             name = name.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
             parameter = params[name]
-            loader = getattr(parameter, "weight_loader", default_weight_loader)
+            loader = typing.cast(
+                Callable[..., typing.Any],
+                getattr(parameter, "weight_loader", default_weight_loader),
+            )
             loader(parameter, loaded_weight)
             loaded.add(name)
 

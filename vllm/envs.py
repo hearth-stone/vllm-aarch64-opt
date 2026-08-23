@@ -883,9 +883,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CPU_FUSED_CPP_STRICT": lambda: bool(
         int(os.getenv("VLLM_CPU_FUSED_CPP_STRICT", "0"))
     ),
-    "VLLM_CPU_MOE_PREPACKED_DIR": lambda: os.getenv(
-        "VLLM_CPU_MOE_PREPACKED_DIR"
-    ),
+    "VLLM_CPU_MOE_PREPACKED_DIR": lambda: os.getenv("VLLM_CPU_MOE_PREPACKED_DIR"),
     "VLLM_CPU_MOE_PREPACK_EXPORT_DIR": lambda: os.getenv(
         "VLLM_CPU_MOE_PREPACK_EXPORT_DIR"
     ),

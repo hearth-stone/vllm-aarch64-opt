@@ -3,7 +3,7 @@
 """CPU-only DeepSeek V4 sparse-MLA metadata and cache backends."""
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import torch
 
@@ -20,7 +20,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, SlidingWindowMLASpec
 
 _C128A_ALIGNMENT = 128
 
@@ -381,7 +381,7 @@ class DeepseekV4CPUSWAMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
-        self.window_size = int(kv_cache_spec.sliding_window)
+        self.window_size = int(cast(SlidingWindowMLASpec, kv_cache_spec).sliding_window)
         self.block_size = int(kv_cache_spec.block_size)
         self.max_model_len = vllm_config.model_config.max_model_len
         self.max_tokens = vllm_config.scheduler_config.max_num_batched_tokens

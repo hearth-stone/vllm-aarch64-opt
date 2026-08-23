@@ -185,9 +185,7 @@ def _cache_key(layer: torch.nn.Module, quant_mode: str = "bf16") -> dict[str, An
             {
                 "routed_w13_scale_shape": tuple(layer.w13_weight_scale.shape),
                 "routed_w2_scale_shape": tuple(layer.w2_weight_scale.shape),
-                "shared_w13_scale_shape": tuple(
-                    shared.gate_up_proj.weight_scale.shape
-                ),
+                "shared_w13_scale_shape": tuple(shared.gate_up_proj.weight_scale.shape),
                 "shared_w2_scale_shape": tuple(shared.down_proj.weight_scale.shape),
             }
         )
@@ -575,9 +573,7 @@ class _FusedCppArmInt8Experts(FusedCppArmExperts):
         if prepacked_dir:
             self.prepared = _load_prepacked(prepacked_dir, layer, moe, self.quant_mode)
         elif export_dir and _cache_path(export_dir, layer).is_file():
-            self.prepared = _load_prepacked(
-                export_dir, layer, moe, self.quant_mode
-            )
+            self.prepared = _load_prepacked(export_dir, layer, moe, self.quant_mode)
         else:
             prepare = getattr(moe, self.prepare_name)
             self.prepared = prepare(*values)

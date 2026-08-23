@@ -149,9 +149,7 @@ class DeepseekV4MoE(nn.Module):
         # The current CPU baseline computes router logits with fused_cpp and
         # returns fp32.  Keep that numerically stable path for V4: small BF16
         # GEMM differences can otherwise change the discrete expert selection.
-        _configure_cpu_router_gate(
-            self.gate, strict=envs.VLLM_CPU_FUSED_CPP_STRICT
-        )
+        _configure_cpu_router_gate(self.gate, strict=envs.VLLM_CPU_FUSED_CPP_STRICT)
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
         if extract_layer_index(prefix) < config.num_hash_layers:
@@ -591,8 +589,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if is_pp_missing_parameter(name, self):
                     continue
                 parameter = params[name]
-                weight_loader = getattr(
-                    parameter, "weight_loader", default_weight_loader
+                weight_loader = typing.cast(
+                    Callable[..., typing.Any],
+                    getattr(parameter, "weight_loader", default_weight_loader),
                 )
                 weight_loader(parameter, loaded_weight)
                 loaded.add(name)

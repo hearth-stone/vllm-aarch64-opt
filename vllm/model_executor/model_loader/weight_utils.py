@@ -931,6 +931,7 @@ def safetensors_weights_iterator(
                 ".w3.scale",
             )
         )
+
     for st_file in tqdm(
         sorted_files,
         desc=loading_desc,

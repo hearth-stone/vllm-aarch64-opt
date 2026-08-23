@@ -49,9 +49,9 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
                 raise RuntimeError(
                     "CPU INT8-to-BF16 linear requires one scale per output channel"
                 )
-            dequantized = (
-                weight.float() * scale.reshape(-1, 1).float()
-            ).to(torch.bfloat16)
+            dequantized = (weight.float() * scale.reshape(-1, 1).float()).to(
+                torch.bfloat16
+            )
             replace_parameter(
                 layer,
                 w_q_name,
