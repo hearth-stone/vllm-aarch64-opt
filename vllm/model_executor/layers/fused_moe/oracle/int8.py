@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
@@ -24,6 +25,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt8StaticChannelSym,
 )
 from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import CpuArchEnum, current_platform
 
 logger = init_logger(__name__)
 
@@ -32,6 +34,7 @@ class Int8MoeBackend(Enum):
     TRITON = "TRITON"
     HUMMING = "HUMMING"
     CPU = "CPU"
+    FUSED_CPP_ARM = "fused_cpp Arm Plan V2"
 
 
 def _get_priority_backends(
@@ -40,11 +43,19 @@ def _get_priority_backends(
     """
     Get available backends in priority order based on platform and config.
     """
-    return [
+    backends = [
         Int8MoeBackend.TRITON,
         Int8MoeBackend.HUMMING,
         Int8MoeBackend.CPU,
     ]
+    if (
+        current_platform.is_cpu()
+        and current_platform.get_cpu_architecture() == CpuArchEnum.ARM
+    ):
+        backends.insert(0, Int8MoeBackend.FUSED_CPP_ARM)
+        if envs.VLLM_CPU_FUSED_CPP_STRICT:
+            return [Int8MoeBackend.FUSED_CPP_ARM]
+    return backends
 
 
 def backend_to_kernel_cls(
@@ -76,6 +87,13 @@ def backend_to_kernel_cls(
         )
 
         return [ArmCPUExpertsInt8, CPUExpertsInt8]
+    elif backend == Int8MoeBackend.FUSED_CPP_ARM:
+        from vllm.model_executor.layers.fused_moe.experts.fused_cpp_cpu_moe import (
+            FusedCppArmW8A8Experts,
+            FusedCppArmW8A16Experts,
+        )
+
+        return [FusedCppArmW8A8Experts, FusedCppArmW8A16Experts]
     else:
         raise ValueError(f"Unknown Int8 MoE backend: {backend.value}")
 
@@ -272,7 +290,11 @@ def convert_to_int8_moe_kernel_format(
             quant_config=_humming_int8_weight_schema(w13, layer.w13_weight_scale),
         )
         return layer.w13_weight, layer.w2_weight
-    elif int8_backend not in (Int8MoeBackend.TRITON, Int8MoeBackend.CPU):
+    elif int8_backend not in (
+        Int8MoeBackend.TRITON,
+        Int8MoeBackend.CPU,
+        Int8MoeBackend.FUSED_CPP_ARM,
+    ):
         raise ValueError(f"Unsupported Int8 MoE backend: {int8_backend.value}")
 
     return w13, w2

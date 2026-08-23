@@ -37,6 +37,34 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_cpu_int8_dequantize_to_bf16", False):
+            w_q_name, w_s_name, _, _, _ = self.layer_param_names
+            weight = getattr(layer, w_q_name)
+            scale = getattr(layer, w_s_name)
+            if weight.dtype != torch.int8 or scale.dtype != torch.float32:
+                raise RuntimeError(
+                    "CPU INT8-to-BF16 linear requires INT8 weight and FP32 scale"
+                )
+            if scale.numel() != weight.shape[0]:
+                raise RuntimeError(
+                    "CPU INT8-to-BF16 linear requires one scale per output channel"
+                )
+            dequantized = (
+                weight.float() * scale.reshape(-1, 1).float()
+            ).to(torch.bfloat16)
+            replace_parameter(
+                layer,
+                w_q_name,
+                torch.nn.Parameter(dequantized, requires_grad=False),
+            )
+            self.linear_method = self._apply_weights_dequantized_bf16
+            return
+        # DeepSeek V4 combines selected checkpoint-native INT8 projections in
+        # model-owned fused_cpp prepare calls.  Repacking them independently
+        # here would destroy the canonical [N, K] weight/scale layout before
+        # the joint prepare hook runs.
+        if getattr(layer, "_cpu_fused_cpp_joint_int8_owned", False):
+            return
         w_q_name, _, _, _, _ = self.layer_param_names
         weight = getattr(layer, w_q_name)
         dtype = weight.dtype
@@ -51,6 +79,15 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         else:
             self.linear_method = self._apply_weights_onednn
             self.process_weights_for_onednn(layer)
+
+    def _apply_weights_dequantized_bf16(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        w_q_name, _, _, _, _ = self.layer_param_names
+        return torch.nn.functional.linear(x, getattr(layer, w_q_name), bias)
 
     def process_weights_for_onednn(self, layer: torch.nn.Module) -> None:
         # WEIGHT
