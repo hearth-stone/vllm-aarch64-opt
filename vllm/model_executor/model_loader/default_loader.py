@@ -39,6 +39,8 @@ from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
 
+_CPU_MOE_PREPACKED_DIR_ENV = "VLLM_CPU_MOE_PREPACKED_DIR"
+
 
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
@@ -264,18 +266,42 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
+            skip_prepacked_moe_weights = bool(
+                os.environ.get(_CPU_MOE_PREPACKED_DIR_ENV)
+            )
+            if skip_prepacked_moe_weights:
+                logger.info_once(
+                    "Loading CPU MoE prepack cache from %s; checkpoint expert "
+                    "weight and scale tensors will not be materialized.",
+                    os.environ[_CPU_MOE_PREPACKED_DIR_ENV],
+                )
             if self.load_config.load_format == "fastsafetensors":
+                if skip_prepacked_moe_weights:
+                    raise ValueError(
+                        "VLLM_CPU_MOE_PREPACKED_DIR requires the default "
+                        "safetensors iterator, not fastsafetensors"
+                    )
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                 )
             elif self.load_config.load_format == "instanttensor":
+                if skip_prepacked_moe_weights:
+                    raise ValueError(
+                        "VLLM_CPU_MOE_PREPACKED_DIR requires the default "
+                        "safetensors iterator, not instanttensor"
+                    )
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):
+                    if skip_prepacked_moe_weights:
+                        raise ValueError(
+                            "VLLM_CPU_MOE_PREPACKED_DIR is incompatible with "
+                            "enable_multithread_load"
+                        )
                     weights_iterator = multi_thread_safetensors_weights_iterator(
                         hf_weights_files,
                         self.load_config.use_tqdm_on_load,
@@ -284,11 +310,20 @@ class DefaultModelLoader(BaseModelLoader):
                         ),
                     )
                 else:
+                    if skip_prepacked_moe_weights and (
+                        self.load_config.safetensors_load_strategy
+                        in ("eager", "torchao")
+                    ):
+                        raise ValueError(
+                            "VLLM_CPU_MOE_PREPACKED_DIR requires lazy/default "
+                            "safetensors loading so raw expert tensors are not read"
+                        )
                     weights_iterator = safetensors_weights_iterator(
                         hf_weights_files,
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        skip_prepacked_moe_weights=skip_prepacked_moe_weights,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
