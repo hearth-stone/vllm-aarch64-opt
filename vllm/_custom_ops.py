@@ -2453,6 +2453,51 @@ def topk_hash_softplus_sqrt(
     hash_indices_table: torch.Tensor | None = None,
     is_padding: torch.Tensor | None = None,
 ) -> None:
+    if (
+        gating_output.device.type == "cpu"
+        and not hasattr(torch.ops._moe_C, "topk_softplus_sqrt")
+    ):
+        # The stable MoE extension only builds this operator for CUDA/ROCm.
+        # Preserve its exact public semantics for DeepSeek V4 on CPU.
+        scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
+        selection_scores = scores
+        if e_score_correction_bias is not None:
+            selection_scores = scores + e_score_correction_bias.unsqueeze(0)
+        if hash_indices_table is not None:
+            if input_tokens is None:
+                raise ValueError("input_tokens is required for hashed routing")
+            selected_ids = hash_indices_table[input_tokens.long()]
+        else:
+            selected_ids = torch.topk(
+                selection_scores,
+                k=topk_weights.shape[-1],
+                dim=-1,
+                sorted=envs.VLLM_BATCH_INVARIANT,
+            ).indices
+        selected_weights = scores.gather(1, selected_ids.long())
+        if renormalize:
+            selected_weights = selected_weights / selected_weights.sum(
+                dim=-1, keepdim=True
+            )
+        selected_weights *= routed_scaling_factor
+
+        invalid = torch.isnan(gating_output).any(dim=-1)
+        if is_padding is not None:
+            invalid |= is_padding
+        selected_weights.masked_fill_(invalid.unsqueeze(-1), 0)
+        selected_ids = selected_ids.masked_fill(invalid.unsqueeze(-1), -1)
+        topk_weights.copy_(selected_weights)
+        topk_indices.copy_(selected_ids)
+        source_rows = torch.arange(
+            gating_output.shape[0], dtype=torch.int32, device=gating_output.device
+        ).unsqueeze(1)
+        source_rows = source_rows + torch.arange(
+            topk_weights.shape[1],
+            dtype=torch.int32,
+            device=gating_output.device,
+        ).unsqueeze(0) * gating_output.shape[0]
+        token_expert_indices.copy_(source_rows)
+        return
     torch.ops._moe_C.topk_softplus_sqrt(
         topk_weights,
         topk_indices,
