@@ -56,7 +56,17 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.utils import record_function_or_nullcontext
 
 from .attention import DeepseekV4CPUAttention
-from .mhc import broadcast_residual, hc_head, mhc_fused_post_pre, mhc_post, mhc_pre
+from .mhc import (
+    broadcast_residual,
+    fused_cpp_mhc_post_head_rmsnorm,
+    fused_cpp_mhc_post_pre_rmsnorm,
+    fused_cpp_mhc_pre_rmsnorm,
+    hc_head,
+    mhc_fused_post_pre,
+    mhc_post,
+    mhc_pre,
+    prepare_fused_cpp_mhc_weight,
+)
 
 logger = init_logger(__name__)
 
@@ -301,6 +311,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
+        self._prepared_hc_attn_fn = None
+        self._prepared_hc_ffn_fn = None
+
+    def process_mhc_weights_after_loading(self) -> None:
+        required = envs.VLLM_CPU_FUSED_CPP_STRICT
+        if self._prepared_hc_attn_fn is None:
+            self._prepared_hc_attn_fn = prepare_fused_cpp_mhc_weight(
+                self.hc_attn_fn.detach(),
+                kind="pre",
+                required=required,
+            )
+        if self._prepared_hc_ffn_fn is None:
+            self._prepared_hc_ffn_fn = prepare_fused_cpp_mhc_weight(
+                self.hc_ffn_fn.detach(),
+                kind="pre",
+                required=required,
+            )
 
     def _pre(
         self,
@@ -311,22 +338,53 @@ class DeepseekV4DecoderLayer(nn.Module):
         fn: torch.Tensor,
         scale: torch.Tensor,
         base: torch.Tensor,
+        norm: RMSNorm,
+        prepared_fn: typing.Any | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = broadcast_residual(x, self.hc_mult)
-            post_mix, res_mix, x = mhc_pre(
+            if prepared_fn is not None:
+                post_mix, res_mix, x = fused_cpp_mhc_pre_rmsnorm(
+                    residual,
+                    prepared_fn,
+                    scale,
+                    base,
+                    norm.weight,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                )
+            else:
+                post_mix, res_mix, x = mhc_pre(
+                    residual,
+                    fn,
+                    scale,
+                    base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                )
+                x = norm(x)
+            return residual, post_mix, res_mix, x
+        assert post_mix is not None and res_mix is not None
+        if prepared_fn is not None:
+            return fused_cpp_mhc_post_pre_rmsnorm(
+                x,
                 residual,
-                fn,
+                post_mix,
+                res_mix,
+                prepared_fn,
                 scale,
                 base,
+                norm.weight,
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
             )
-            return residual, post_mix, res_mix, x
-        assert post_mix is not None and res_mix is not None
-        return mhc_fused_post_pre(
+        residual, post_mix, res_mix, x = mhc_fused_post_pre(
             x,
             residual,
             post_mix,
@@ -339,6 +397,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
         )
+        return residual, post_mix, res_mix, norm(x)
 
     def forward(
         self,
@@ -357,8 +416,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
+            self.attn_norm,
+            self._prepared_hc_attn_fn,
         )
-        x = self.attn(positions, self.attn_norm(x))
+        x = self.attn(positions, x)
         residual, post_mix, res_mix, x = self._pre(
             x,
             residual,
@@ -367,8 +428,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            self.ffn_norm,
+            self._prepared_hc_ffn_fn,
         )
-        x = self.ffn(self.ffn_norm(x), input_ids)
+        x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
 
@@ -422,6 +485,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.hc_head_scale = nn.Parameter(
             torch.empty(1, dtype=torch.float32), requires_grad=False
         )
+        self._prepared_hc_head_fn = None
         spec_config = vllm_config.speculative_config
         needs_mtp = spec_config is not None and (
             spec_config.use_eagle() or spec_config.uses_draft_model()
@@ -453,6 +517,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
             }
         )
+
+    def process_mhc_weights_after_loading(self) -> None:
+        for layer in self.layers:
+            if isinstance(layer, DeepseekV4DecoderLayer):
+                layer.process_mhc_weights_after_loading()
+        if get_pp_group().is_last_rank and self._prepared_hc_head_fn is None:
+            self._prepared_hc_head_fn = prepare_fused_cpp_mhc_weight(
+                self.hc_head_fn.detach(),
+                kind="head",
+                required=envs.VLLM_CPU_FUSED_CPP_STRICT,
+            )
+            if self._prepared_hc_head_fn is not None:
+                logger.info_once(
+                    "Using fused_cpp SVE DeepSeek V4 mHC pre, post-pre, "
+                    "and post-head RMSNorm stages."
+                )
 
     def forward(
         self,
@@ -489,23 +569,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if idx + 1 in self.aux_hidden_state_layers:
                 aux = mhc_post(hidden_states, residual, post_mix, res_mix).mean(dim=1)
                 aux_hidden_states.append(aux)
+        final_residual = None
         if layer is not None:
-            hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
+            assert residual is not None and post_mix is not None and res_mix is not None
+            if get_pp_group().is_last_rank and self._prepared_hc_head_fn is not None:
+                hidden_states, final_residual = fused_cpp_mhc_post_head_rmsnorm(
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self._prepared_hc_head_fn,
+                    self.hc_head_scale,
+                    self.hc_head_base,
+                    self.norm.weight,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
+            else:
+                hidden_states = mhc_post(
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
         if self._mtp_hidden_buffer is not None:
             count = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:count].copy_(hidden_states.flatten(1))
-        hidden_states = hc_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
-        hidden_states = self.norm(hidden_states)
+            mtp_hidden = final_residual if final_residual is not None else hidden_states
+            self._mtp_hidden_buffer[:count].copy_(mtp_hidden.flatten(1))
+        if final_residual is None:
+            hidden_states = hc_head(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+            hidden_states = self.norm(hidden_states)
         return (
             (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
         )
@@ -748,6 +851,7 @@ class DeepseekV4ForCausalLM(
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
+        self.model.process_mhc_weights_after_loading()
         for module in self.modules():
             if isinstance(module, DeepseekV4CPUAttention):
                 module.process_weights_after_loading()

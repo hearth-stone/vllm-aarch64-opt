@@ -20,12 +20,14 @@ from vllm.model_executor.layers.fused_moe.experts.fused_cpp_cpu_moe import (
 from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from vllm.models.deepseek_v4.cpu import mhc as cpu_mhc
 from vllm.models.deepseek_v4.cpu.attention import (
     DeepseekV4CPUAttention,
     _compressed_prefill_ranges,
 )
 from vllm.models.deepseek_v4.cpu.mhc import hc_head, mhc_post, mhc_pre
 from vllm.models.deepseek_v4.cpu.model import (
+    DeepseekV4DecoderLayer,
     DeepseekV4MoE,
     _configure_cpu_router_gate,
 )
@@ -157,6 +159,89 @@ def test_torch_mhc_reference_shapes_and_head_formula():
     gates = torch.sigmoid((x @ head_fn.t()) * rrms * scale[0] + base[:hc_mult])
     expected = ((gates + 1e-6).unsqueeze(-1) * residual.float()).sum(1)
     torch.testing.assert_close(head.float(), expected.to(torch.bfloat16).float())
+
+
+def test_fused_cpp_mhc_adapter_prepares_once_and_forwards_contract(monkeypatch):
+    calls = []
+    prepared = object()
+    expected = (
+        torch.empty(2, 4, 1),
+        torch.empty(2, 4, 4),
+        torch.empty(2, 8, dtype=torch.bfloat16),
+    )
+
+    fake_mhc = SimpleNamespace(
+        prepare_mhc_weight=lambda weight, **kwargs: (
+            calls.append(("prepare", weight, kwargs)) or prepared
+        ),
+        mhc_pre_rmsnorm_sve_candidate=lambda *args, **kwargs: (
+            calls.append(("pre", args, kwargs)) or expected
+        ),
+    )
+    monkeypatch.setattr(cpu_mhc, "_load_fused_cpp_mhc", lambda: fake_mhc)
+    weight = torch.empty(24, 32, dtype=torch.float32)
+    assert (
+        cpu_mhc.prepare_fused_cpp_mhc_weight(
+            weight,
+            kind="pre",
+            required=True,
+        )
+        is prepared
+    )
+    residual = torch.empty(2, 4, 8, dtype=torch.bfloat16)
+    scale = torch.empty(3)
+    base = torch.empty(24)
+    norm_weight = torch.empty(8, dtype=torch.bfloat16)
+    actual = cpu_mhc.fused_cpp_mhc_pre_rmsnorm(
+        residual,
+        prepared,
+        scale,
+        base,
+        norm_weight,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+    )
+    assert actual is expected
+    assert calls[0] == ("prepare", weight, {"kind": "pre"})
+    assert calls[1][1][:5] == (residual, prepared, scale, base, norm_weight)
+    assert calls[1][2] == {
+        "rms_eps": 1e-6,
+        "hc_pre_eps": 1e-6,
+        "hc_sinkhorn_eps": 1e-6,
+        "hc_post_mult_value": 2.0,
+        "sinkhorn_repeat": 20,
+        "norm_eps": 1e-6,
+        "num_threads": torch.get_num_threads(),
+    }
+
+
+def test_decoder_mhc_weights_are_prepared_once(monkeypatch):
+    calls = []
+
+    def prepare(weight, *, kind, required):
+        calls.append((weight, kind, required))
+        return object()
+
+    monkeypatch.setenv("VLLM_CPU_FUSED_CPP_STRICT", "1")
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.cpu.model.prepare_fused_cpp_mhc_weight",
+        prepare,
+    )
+    layer = object.__new__(DeepseekV4DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    layer.hc_attn_fn = torch.nn.Parameter(torch.empty(24, 32))
+    layer.hc_ffn_fn = torch.nn.Parameter(torch.empty(24, 32))
+    layer._prepared_hc_attn_fn = None
+    layer._prepared_hc_ffn_fn = None
+
+    layer.process_mhc_weights_after_loading()
+    layer.process_mhc_weights_after_loading()
+
+    assert len(calls) == 2
+    assert [call[1] for call in calls] == ["pre", "pre"]
+    assert all(call[2] for call in calls)
 
 
 def test_compressed_slot_mapping_handles_padding_and_page_lookup():

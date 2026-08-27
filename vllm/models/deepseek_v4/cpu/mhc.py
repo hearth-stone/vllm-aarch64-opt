@@ -7,7 +7,140 @@ CUDA, Triton and TileLang kernels at module import time, which is undesirable
 for the CPU-isolated DeepSeek V4 path.
 """
 
+import typing
+from functools import lru_cache
+
 import torch
+
+
+@lru_cache(maxsize=1)
+def _load_fused_cpp_mhc() -> typing.Any | None:
+    try:
+        import fused_cpp.deepseek_v4_mhc as fused_mhc
+    except (ImportError, AttributeError):
+        return None
+    required = (
+        "prepare_mhc_weight",
+        "mhc_pre_rmsnorm_sve_candidate",
+        "mhc_post_pre_rmsnorm_sve_candidate",
+        "mhc_post_hc_head_rmsnorm_sve_candidate",
+    )
+    if not fused_mhc._HAS_DEEPSEEK_V4_MHC_SVE_PROJECTION:
+        return None
+    if any(not hasattr(fused_mhc, name) for name in required):
+        return None
+    return fused_mhc
+
+
+def prepare_fused_cpp_mhc_weight(
+    fn: torch.Tensor,
+    *,
+    kind: str,
+    required: bool,
+) -> typing.Any | None:
+    fused_mhc = _load_fused_cpp_mhc()
+    if fused_mhc is None:
+        if required:
+            raise RuntimeError("required fused_cpp DeepSeek V4 mHC is unavailable")
+        return None
+    return fused_mhc.prepare_mhc_weight(fn, kind=kind)
+
+
+def fused_cpp_mhc_pre_rmsnorm(
+    residual: torch.Tensor,
+    prepared_fn: typing.Any,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    post_alpha: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fused_mhc = _load_fused_cpp_mhc()
+    if fused_mhc is None:
+        raise RuntimeError("fused_cpp DeepSeek V4 mHC disappeared after preparation")
+    return fused_mhc.mhc_pre_rmsnorm_sve_candidate(
+        residual,
+        prepared_fn,
+        scale,
+        base,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_eps,
+        hc_sinkhorn_eps=hc_eps,
+        hc_post_mult_value=post_alpha,
+        sinkhorn_repeat=sinkhorn_iters,
+        norm_eps=rms_eps,
+        num_threads=torch.get_num_threads(),
+    )
+
+
+def fused_cpp_mhc_post_pre_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    res_mix: torch.Tensor,
+    prepared_fn: typing.Any,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    post_alpha: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    fused_mhc = _load_fused_cpp_mhc()
+    if fused_mhc is None:
+        raise RuntimeError("fused_cpp DeepSeek V4 mHC disappeared after preparation")
+    return fused_mhc.mhc_post_pre_rmsnorm_sve_candidate(
+        x,
+        residual,
+        post_mix,
+        res_mix,
+        prepared_fn,
+        scale,
+        base,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_eps,
+        hc_sinkhorn_eps=hc_eps,
+        hc_post_mult_value=post_alpha,
+        sinkhorn_repeat=sinkhorn_iters,
+        norm_eps=rms_eps,
+        num_threads=torch.get_num_threads(),
+    )
+
+
+def fused_cpp_mhc_post_head_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    res_mix: torch.Tensor,
+    prepared_fn: typing.Any,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fused_mhc = _load_fused_cpp_mhc()
+    if fused_mhc is None:
+        raise RuntimeError("fused_cpp DeepSeek V4 mHC disappeared after preparation")
+    return fused_mhc.mhc_post_hc_head_rmsnorm_sve_candidate(
+        x,
+        residual,
+        post_mix,
+        res_mix,
+        prepared_fn,
+        scale,
+        base,
+        norm_weight,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        norm_eps=rms_eps,
+        num_threads=torch.get_num_threads(),
+    )
 
 
 def mhc_pre(
@@ -125,8 +258,12 @@ def broadcast_residual(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
 
 __all__ = [
     "broadcast_residual",
+    "fused_cpp_mhc_post_head_rmsnorm",
+    "fused_cpp_mhc_post_pre_rmsnorm",
+    "fused_cpp_mhc_pre_rmsnorm",
     "hc_head",
     "mhc_fused_post_pre",
     "mhc_post",
     "mhc_pre",
+    "prepare_fused_cpp_mhc_weight",
 ]
