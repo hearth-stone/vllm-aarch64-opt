@@ -358,7 +358,7 @@ def _get_numactl_worker_args(
             cpu_binding,
             numa_node,
         )
-        return f"--physcpubind={cpu_binding} --membind={numa_node}"
+        return f"--all --physcpubind={cpu_binding} --membind={numa_node}"
 
     logger.info(
         "Binding worker subprocess (local_rank=%s, gpu_index=%s) to NUMA node %s",
@@ -366,7 +366,7 @@ def _get_numactl_worker_args(
         gpu_index,
         numa_node,
     )
-    return f"--cpunodebind={numa_node} --membind={numa_node}"
+    return f"--all --cpunodebind={numa_node} --membind={numa_node}"
 
 
 def _get_enginecore_numa_nodes(

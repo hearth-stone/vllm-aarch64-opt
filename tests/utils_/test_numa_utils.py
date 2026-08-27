@@ -59,7 +59,7 @@ def test_get_numactl_args_with_node_binding():
     vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[0, 1])
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
-        == "--cpunodebind=1 --membind=1"
+        == "--all --cpunodebind=1 --membind=1"
     )
 
 
@@ -71,7 +71,7 @@ def test_get_numactl_args_with_cpu_binding():
     )
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
-        == "--physcpubind=4-7 --membind=1"
+        == "--all --physcpubind=4-7 --membind=1"
     )
 
 
@@ -209,7 +209,7 @@ def test_get_numactl_args_uses_pct_when_user_did_not_specify_cpus(monkeypatch):
     vllm_config = _make_config(numa_bind=True, numa_bind_nodes=[0, 1])
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
-        == "--physcpubind=0,1,16,17,64,65,80,81 --membind=1"
+        == "--all --physcpubind=0,1,16,17,64,65,80,81 --membind=1"
     )
 
 
@@ -364,7 +364,7 @@ def test_get_numactl_args_user_cpus_override_pct(monkeypatch):
     )
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
-        == "--physcpubind=4-7 --membind=1"
+        == "--all --physcpubind=4-7 --membind=1"
     )
 
 
@@ -378,7 +378,7 @@ def test_get_numactl_args_uses_dp_offset():
     )
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
-        == "--cpunodebind=1 --membind=1"
+        == "--all --cpunodebind=1 --membind=1"
     )
 
 
@@ -486,12 +486,15 @@ def test_configure_subprocess_numa_fallback(monkeypatch):
 
     monkeypatch.setattr(numa_utils.subprocess, "run", _fake_numactl_run([]))
     with numa_utils.configure_subprocess(node_config, local_rank=0):
-        assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--cpunodebind=0 --membind=0"
+        assert (
+            os.environ[numa_utils._NUMACTL_ARGS_ENV]
+            == "--all --cpunodebind=0 --membind=0"
+        )
 
     membind_fails = _fake_numactl_run(["--membind="])
     monkeypatch.setattr(numa_utils.subprocess, "run", membind_fails)
     with numa_utils.configure_subprocess(node_config, local_rank=0):
-        assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--cpunodebind=0"
+        assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--all --cpunodebind=0"
 
     cpu_config = _make_config(
         numa_bind=True,
@@ -499,7 +502,7 @@ def test_configure_subprocess_numa_fallback(monkeypatch):
         numa_bind_cpus=["0-3"],
     )
     with numa_utils.configure_subprocess(cpu_config, local_rank=0):
-        assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--physcpubind=0-3"
+        assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--all --physcpubind=0-3"
 
     before = multiprocessing.spawn.get_executable()
     monkeypatch.setattr(
