@@ -847,6 +847,22 @@ class DeepseekV4ForCausalLM(
         return self.model._mtp_hidden_buffer
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if getattr(self.config, "cpu_fp8_to_int8", False):
+            from .fp8_requant import convert_fp8_checkpoint_for_cpu_w8a8
+
+            block_size = tuple(
+                getattr(self.config, "cpu_fp8_source_block_size", (128, 128))
+            )
+            rows_per_chunk = int(
+                getattr(self.config, "cpu_fp8_conversion_rows_per_chunk", 2048)
+            )
+            weights = convert_fp8_checkpoint_for_cpu_w8a8(
+                weights,
+                block_size=typing.cast(tuple[int, int], block_size),
+                rows_per_chunk=rows_per_chunk,
+                tp_rank=get_tensor_model_parallel_rank(),
+                tp_size=get_tensor_model_parallel_world_size(),
+            )
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 

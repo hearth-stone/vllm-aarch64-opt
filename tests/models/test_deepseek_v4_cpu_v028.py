@@ -17,13 +17,21 @@ from vllm.model_executor.layers.fused_moe.experts import fused_cpp_cpu_moe
 from vllm.model_executor.layers.fused_moe.experts.fused_cpp_cpu_moe import (
     FusedCppArmExperts,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.models.deepseek_v4.cpu import mhc as cpu_mhc
 from vllm.models.deepseek_v4.cpu.attention import (
     DeepseekV4CPUAttention,
     _compressed_prefill_ranges,
+)
+from vllm.models.deepseek_v4.cpu.fp8_requant import (
+    convert_block_fp8_weight,
+    convert_fp8_checkpoint_for_cpu_w8a8,
+    is_cpu_w8a8_target,
+    make_cpu_w8a8_quantization_config,
 )
 from vllm.models.deepseek_v4.cpu.mhc import hc_head, mhc_post, mhc_pre
 from vllm.models.deepseek_v4.cpu.model import (
@@ -442,3 +450,189 @@ def test_fused_cpp_prepack_key_covers_rank_shapes_quant_and_abi(monkeypatch):
     assert key["routed_w13_shape"] == (8, 16, 4)
     assert key["shared_w2_scale_shape"] == (4, 1)
     assert key["quant_mode"] == "W8A8"
+
+
+def test_block_fp8_conversion_produces_int8_per_channel_and_bf16():
+    source = torch.tensor(
+        [
+            [1.0, -2.0, 3.0, -4.0],
+            [2.0, 1.0, -1.0, -2.0],
+            [4.0, -3.0, 2.0, -1.0],
+        ],
+        dtype=torch.float32,
+    ).to(torch.float8_e4m3fn)
+    block_scales = torch.tensor([[0.5, 2.0], [1.5, 0.25]])
+    expanded = torch.tensor(
+        [
+            [0.5, 0.5, 2.0, 2.0],
+            [0.5, 0.5, 2.0, 2.0],
+            [1.5, 1.5, 0.25, 0.25],
+        ]
+    )
+    dequantized = source.float() * expanded
+
+    int8_weight, int8_scale = convert_block_fp8_weight(
+        source,
+        block_scales,
+        to_int8=True,
+        block_size=(2, 2),
+        rows_per_chunk=2,
+    )
+    assert int8_scale is not None
+    expected_scale = dequantized.abs().amax(dim=1, keepdim=True) / 127
+    expected_int8 = (
+        dequantized.div(expected_scale).round().clamp(-127, 127).to(torch.int8)
+    )
+    torch.testing.assert_close(int8_scale, expected_scale)
+    torch.testing.assert_close(int8_weight, expected_int8)
+
+    bf16_weight, bf16_scale = convert_block_fp8_weight(
+        source,
+        block_scales,
+        to_int8=False,
+        block_size=(2, 2),
+        rows_per_chunk=2,
+    )
+    assert bf16_scale is None
+    torch.testing.assert_close(bf16_weight, dequantized.to(torch.bfloat16))
+
+
+def test_fp8_checkpoint_stream_converts_supported_targets_only():
+    fp8 = torch.tensor([[1.0, -2.0], [3.0, 4.0]]).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5]], dtype=torch.float32)
+    norm = torch.ones(2, dtype=torch.bfloat16)
+    converted = dict(
+        convert_fp8_checkpoint_for_cpu_w8a8(
+            [
+                ("layers.0.attn.wq_b.scale", scale),
+                ("layers.0.attn.wq_b.weight", fp8),
+                ("layers.0.attn.wq_a.weight", fp8),
+                ("layers.0.attn.wq_a.scale", scale),
+                ("layers.0.attn_norm.weight", norm),
+            ],
+            block_size=(2, 2),
+            rows_per_chunk=2,
+        )
+    )
+    assert converted["layers.0.attn.wq_b.weight"].dtype is torch.int8
+    assert converted["layers.0.attn.wq_b.weight_scale"].shape == (2, 1)
+    assert converted["layers.0.attn.wq_a.weight"].dtype is torch.bfloat16
+    assert "layers.0.attn.wq_a.scale" not in converted
+    assert converted["layers.0.attn_norm.weight"] is norm
+
+
+def test_pro_cpu_w8a8_targets_and_ignore_config_cover_even_indexers():
+    assert is_cpu_w8a8_target("layers.0.ffn.experts.383.w2.weight")
+    assert is_cpu_w8a8_target("layers.0.ffn.shared_experts.w3.weight")
+    assert is_cpu_w8a8_target("layers.60.attn.indexer.wq_b.weight")
+    assert not is_cpu_w8a8_target("layers.60.attn.wq_a.weight")
+
+    config = make_cpu_w8a8_quantization_config(61)
+    ignore = config["ignore"]
+    assert isinstance(ignore, list)
+    assert "layers.60.attn.indexer.weights_proj" in ignore
+    assert "layers.60.attn.wq_a" in ignore
+    assert "layers.60.attn.wq_b" not in ignore
+    assert "mtp.0.attn.wq_b" in ignore
+
+
+def test_fp8_checkpoint_stream_slices_column_parallel_before_conversion():
+    source = torch.arange(32, dtype=torch.float32).reshape(8, 4).to(
+        torch.float8_e4m3fn
+    )
+    scale = torch.ones(4, 2, dtype=torch.float32)
+    converted = dict(
+        convert_fp8_checkpoint_for_cpu_w8a8(
+            [
+                ("layers.0.ffn.experts.0.w1.scale", scale),
+                ("layers.0.ffn.experts.0.w1.weight", source),
+            ],
+            block_size=(2, 2),
+            rows_per_chunk=2,
+            tp_rank=2,
+            tp_size=4,
+        )
+    )
+    weight = converted["layers.0.ffn.experts.0.w1.weight"]
+    weight_scale = converted["layers.0.ffn.experts.0.w1.weight_scale"]
+    assert weight.shape == (2, 4)
+    assert weight_scale.shape == (2, 1)
+    assert weight._vllm_tp_pre_sharded
+    assert weight_scale._vllm_tp_pre_sharded
+
+    row_parallel = dict(
+        convert_fp8_checkpoint_for_cpu_w8a8(
+            [
+                ("layers.0.ffn.experts.0.w2.scale", scale),
+                ("layers.0.ffn.experts.0.w2.weight", source),
+            ],
+            block_size=(2, 2),
+            rows_per_chunk=2,
+            tp_rank=2,
+            tp_size=4,
+        )
+    )["layers.0.ffn.experts.0.w2.weight"]
+    assert row_parallel.shape == source.shape
+    assert not getattr(row_parallel, "_vllm_tp_pre_sharded", False)
+
+    replicated_indexer = dict(
+        convert_fp8_checkpoint_for_cpu_w8a8(
+            [
+                ("layers.0.attn.indexer.wq_b.scale", scale),
+                ("layers.0.attn.indexer.wq_b.weight", source),
+            ],
+            block_size=(2, 2),
+            rows_per_chunk=2,
+            tp_rank=2,
+            tp_size=4,
+        )
+    )["layers.0.attn.indexer.wq_b.weight"]
+    assert replicated_indexer.shape == source.shape
+    assert not getattr(replicated_indexer, "_vllm_tp_pre_sharded", False)
+
+
+def test_pre_sharded_linear_and_moe_loaders_do_not_slice_twice(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    linear = ModelWeightParameter(
+        data=torch.zeros(2, 3),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=lambda _: None,
+    )
+    linear.tp_rank = 3
+    local = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    local._vllm_tp_pre_sharded = True
+    linear.load_column_parallel_weight(local)
+    torch.testing.assert_close(linear, local)
+
+    merged = ModelWeightParameter(
+        data=torch.zeros(4, 3),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=lambda _: None,
+    )
+    merged.tp_rank = 3
+    merged.load_merged_column_weight(local, shard_offset=2, shard_size=2)
+    torch.testing.assert_close(merged[2:], local)
+    assert torch.count_nonzero(merged[:2]) == 0
+
+    routed = object.__new__(RoutedExperts)
+    routed.moe_config = SimpleNamespace(
+        is_act_and_mul=True,
+        moe_parallel_config=SimpleNamespace(tp_size=4),
+    )
+    destination = torch.zeros(4, 3)
+    routed._load_w13(
+        destination,
+        shard_dim=0,
+        shard_id="w1",
+        loaded_weight=local,
+        tp_rank=3,
+    )
+    torch.testing.assert_close(destination[:2], local)
+    assert torch.count_nonzero(destination[2:]) == 0

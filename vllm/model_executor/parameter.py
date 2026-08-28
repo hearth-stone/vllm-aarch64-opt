@@ -22,11 +22,19 @@ __all__ = [
     "ModelWeightParameter",
     "ChannelQuantScaleParameter",
     "GroupQuantScaleParameter",
+    "is_tp_pre_sharded",
     "PackedColumnParameter",
     "RowvLLMParameter",
 ]
 
 logger = init_logger(__name__)
+
+_TP_PRE_SHARDED_ATTR = "_vllm_tp_pre_sharded"
+
+
+def is_tp_pre_sharded(weight: torch.Tensor) -> bool:
+    """Return whether a checkpoint tensor already contains this rank's TP shard."""
+    return bool(getattr(weight, _TP_PRE_SHARDED_ATTR, False))
 
 
 class BasevLLMParameter(Parameter):
@@ -146,6 +154,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         return self._output_dim
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+        if is_tp_pre_sharded(loaded_weight):
+            self._assert_and_load(loaded_weight)
+            return
         shard_size = self.data.shape[self.output_dim]
         loaded_weight = loaded_weight.narrow(
             self.output_dim, self.tp_rank * shard_size, shard_size
@@ -169,9 +180,10 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
-        )
+        if not is_tp_pre_sharded(loaded_weight):
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, self.tp_rank * shard_size, shard_size
+            )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -193,9 +205,10 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         param_data = self.data
         shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, shard_id_int * shard_size, shard_size
-        )
+        if not is_tp_pre_sharded(loaded_weight):
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, shard_id_int * shard_size, shard_size
+            )
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
@@ -218,10 +231,11 @@ class RowvLLMParameter(BasevLLMParameter):
         return self._input_dim
 
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
-        shard_size = self.data.shape[self.input_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.input_dim, self.tp_rank * shard_size, shard_size
-        )
+        if not is_tp_pre_sharded(loaded_weight):
+            shard_size = self.data.shape[self.input_dim]
+            loaded_weight = loaded_weight.narrow(
+                self.input_dim, self.tp_rank * shard_size, shard_size
+            )
 
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)

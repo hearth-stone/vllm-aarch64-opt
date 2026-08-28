@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.parameter import is_tp_pre_sharded
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
@@ -482,6 +483,7 @@ class RoutedExperts(PluggableLayer):
         tp_rank: int,
         load_full: bool = False,
     ):
+        load_full = load_full or is_tp_pre_sharded(loaded_weight)
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         if self.moe_config.is_act_and_mul:
@@ -532,6 +534,7 @@ class RoutedExperts(PluggableLayer):
         tp_rank: int,
         load_full: bool = False,
     ):
+        load_full = load_full or is_tp_pre_sharded(loaded_weight)
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
