@@ -344,17 +344,20 @@ class DeepseekV4DecoderLayer(nn.Module):
         if residual is None:
             residual = broadcast_residual(x, self.hc_mult)
             if prepared_fn is not None:
-                post_mix, res_mix, x = fused_cpp_mhc_pre_rmsnorm(
-                    residual,
-                    prepared_fn,
-                    scale,
-                    base,
-                    norm.weight,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                )
+                with record_function_or_nullcontext(
+                    "vllm::deepseek_v4_mhc/pre_rmsnorm_fused_cpp"
+                ):
+                    post_mix, res_mix, x = fused_cpp_mhc_pre_rmsnorm(
+                        residual,
+                        prepared_fn,
+                        scale,
+                        base,
+                        norm.weight,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                        self.hc_post_alpha,
+                        self.hc_sinkhorn_iters,
+                    )
             else:
                 post_mix, res_mix, x = mhc_pre(
                     residual,
@@ -370,20 +373,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             return residual, post_mix, res_mix, x
         assert post_mix is not None and res_mix is not None
         if prepared_fn is not None:
-            return fused_cpp_mhc_post_pre_rmsnorm(
-                x,
-                residual,
-                post_mix,
-                res_mix,
-                prepared_fn,
-                scale,
-                base,
-                norm.weight,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-            )
+            with record_function_or_nullcontext(
+                "vllm::deepseek_v4_mhc/post_pre_rmsnorm_fused_cpp"
+            ):
+                return fused_cpp_mhc_post_pre_rmsnorm(
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    prepared_fn,
+                    scale,
+                    base,
+                    norm.weight,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                )
         residual, post_mix, res_mix, x = mhc_fused_post_pre(
             x,
             residual,
@@ -573,18 +579,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if layer is not None:
             assert residual is not None and post_mix is not None and res_mix is not None
             if get_pp_group().is_last_rank and self._prepared_hc_head_fn is not None:
-                hidden_states, final_residual = fused_cpp_mhc_post_head_rmsnorm(
-                    hidden_states,
-                    residual,
-                    post_mix,
-                    res_mix,
-                    self._prepared_hc_head_fn,
-                    self.hc_head_scale,
-                    self.hc_head_base,
-                    self.norm.weight,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                )
+                with record_function_or_nullcontext(
+                    "vllm::deepseek_v4_mhc/post_head_rmsnorm_fused_cpp"
+                ):
+                    hidden_states, final_residual = fused_cpp_mhc_post_head_rmsnorm(
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                        self._prepared_hc_head_fn,
+                        self.hc_head_scale,
+                        self.hc_head_base,
+                        self.norm.weight,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                    )
             else:
                 hidden_states = mhc_post(
                     hidden_states,
