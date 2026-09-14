@@ -91,6 +91,7 @@ def save_compressor_states(
     rows[:, :width] = kv[valid].float()
     ape_rows = positions[valid].to(torch.long).remainder(compress_ratio)
     rows[:, width:] = score[valid].float() + ape.index_select(0, ape_rows).float()
+    state_cache[selected // block_size, selected % block_size] = rows
 
 
 def compress_and_store(

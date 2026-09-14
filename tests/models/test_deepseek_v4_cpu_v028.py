@@ -41,6 +41,7 @@ from vllm.models.deepseek_v4.cpu.model import (
 )
 from vllm.models.deepseek_v4.cpu.ops import (
     gather_paged_cache,
+    save_compressor_states,
     sparse_mla_reference,
     write_paged_cache,
 )
@@ -178,13 +179,17 @@ def test_fused_cpp_mhc_adapter_prepares_once_and_forwards_contract(monkeypatch):
         torch.empty(2, 8, dtype=torch.bfloat16),
     )
 
+    def prepare_mhc_weight(weight, **kwargs):
+        calls.append(("prepare", weight, kwargs))
+        return prepared
+
+    def mhc_pre_rmsnorm(*args, **kwargs):
+        calls.append(("pre", args, kwargs))
+        return expected
+
     fake_mhc = SimpleNamespace(
-        prepare_mhc_weight=lambda weight, **kwargs: (
-            calls.append(("prepare", weight, kwargs)) or prepared
-        ),
-        mhc_pre_rmsnorm_sve_candidate=lambda *args, **kwargs: (
-            calls.append(("pre", args, kwargs)) or expected
-        ),
+        prepare_mhc_weight=prepare_mhc_weight,
+        mhc_pre_rmsnorm_sve_candidate=mhc_pre_rmsnorm,
     )
     monkeypatch.setattr(cpu_mhc, "_load_fused_cpp_mhc", lambda: fake_mhc)
     weight = torch.empty(24, 32, dtype=torch.float32)
@@ -309,6 +314,24 @@ def test_page_padded_cache_write_and_gather():
     write_paged_cache(cache, values, slots)
     gathered = gather_paged_cache(cache, torch.tensor([0, 5]))
     torch.testing.assert_close(gathered, values[[0, 2]])
+
+
+def test_compressor_states_persist_in_page_padded_cache():
+    """Later compression must see KV and position-biased scores saved by Torch."""
+    storage = torch.full((3, 12), -99.0)
+    cache = storage[:, :8].view(3, 2, 4)
+    kv = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.bfloat16)
+    scores = torch.tensor([[10, 20], [30, 40], [50, 60]], dtype=torch.bfloat16)
+    ape = torch.tensor([[0.5, 1.5], [2.5, 3.5]])
+
+    save_compressor_states(
+        kv, scores, ape, torch.tensor([3, 4, 5]), cache, torch.tensor([4, -1, 1]), 2
+    )
+
+    expected = torch.full_like(storage, -99.0)
+    expected[2, :4] = torch.tensor([1, 2, 12.5, 23.5])
+    expected[0, 4:8] = torch.tensor([5, 6, 52.5, 63.5])
+    torch.testing.assert_close(storage, expected)
 
 
 def test_strict_swa_metadata_skips_unused_prefill_index_matrix(monkeypatch):
@@ -537,9 +560,7 @@ def test_pro_cpu_w8a8_targets_and_ignore_config_cover_even_indexers():
 
 
 def test_fp8_checkpoint_stream_slices_column_parallel_before_conversion():
-    source = torch.arange(32, dtype=torch.float32).reshape(8, 4).to(
-        torch.float8_e4m3fn
-    )
+    source = torch.arange(32, dtype=torch.float32).reshape(8, 4).to(torch.float8_e4m3fn)
     scale = torch.ones(4, 2, dtype=torch.float32)
     converted = dict(
         convert_fp8_checkpoint_for_cpu_w8a8(
