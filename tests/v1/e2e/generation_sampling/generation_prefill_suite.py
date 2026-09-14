@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Run exact-token prefill cases sequentially in one vLLM engine."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import threading
@@ -11,9 +15,16 @@ import time
 from pathlib import Path
 
 import numpy as np
+import regex as re
 
 from vllm import LLM, SamplingParams, TokensPrompt
 from vllm.config import ProfilerConfig
+from vllm.model_executor.layers.fused_moe.file_route_recorder import (
+    ROUTE_CAPTURE_CONTROL_ENV,
+    ROUTE_CAPTURE_DIR_ENV,
+    write_route_control,
+)
+from vllm.outputs import RequestOutput
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +68,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--thermal-probe-zones",
         help="Comma-separated thermal zone ids sampled after each request.",
+    )
+    parser.add_argument(
+        "--route-capture-dir",
+        help=(
+            "Capture prompt-token MoE expert IDs as one compressed NPZ per case "
+            "and write aggregate route summaries."
+        ),
     )
     return parser.parse_args()
 
@@ -104,6 +122,161 @@ def build_profiler_config(profile_dir: str) -> ProfilerConfig:
         active_iterations=1,
         wait_iterations=0,
     )
+
+
+def route_output_name(
+    phase: str,
+    request_index: int,
+    source_case_index: int,
+    case_id: object,
+) -> str:
+    safe_case_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(case_id))
+    return (
+        f"{phase}_request{request_index:03d}_case{source_case_index:03d}_"
+        f"{safe_case_id}.npz"
+    )
+
+
+def run_with_route_capture(
+    llm: LLM,
+    prompt: TokensPrompt,
+    sampling_params: SamplingParams,
+    *,
+    route_dir: Path | None,
+    control_path: Path | None,
+    phase: str,
+    request_index: int,
+    source_case_index: int,
+    case: dict[str, object],
+) -> tuple[list[RequestOutput], Path | None]:
+    route_path = None
+    if route_dir is not None:
+        assert control_path is not None
+        output_name = route_output_name(
+            phase,
+            request_index,
+            source_case_index,
+            case["case_id"],
+        )
+        route_path = route_dir / output_name
+        route_path.unlink(missing_ok=True)
+        write_route_control(
+            control_path,
+            {
+                "capture_id": f"{phase}:{request_index}:{source_case_index}",
+                "output_file": output_name,
+                "phase": phase,
+                "request_index": request_index,
+                "source_case_index": source_case_index,
+                "case_id": case["case_id"],
+                "title": case["title"],
+                "prompt_token_ids": case["prompt_token_ids"],
+            },
+        )
+    try:
+        outputs = llm.generate([prompt], sampling_params)
+    finally:
+        if control_path is not None:
+            control_path.unlink(missing_ok=True)
+    if route_path is not None and not route_path.is_file():
+        raise RuntimeError(f"expected MoE route capture file {route_path}")
+    return outputs, route_path
+
+
+def summarize_route_captures(
+    route_dir: Path,
+    manifest_rows: list[dict[str, object]],
+    expected_tokens: int,
+) -> dict[str, object]:
+    route_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = route_dir / "route_manifest.jsonl"
+    counts_by_case = None
+    aggregate_counts = None
+    route_shape = None
+    with manifest_path.open("w", encoding="utf-8") as manifest_file:
+        for row_index, row in enumerate(manifest_rows):
+            route_path = route_dir / str(row["route_file"])
+            with np.load(route_path, allow_pickle=False) as payload:
+                expert_ids = payload["expert_ids"]
+                prompt_token_ids = payload["prompt_token_ids"]
+                shared_expert_ids = payload["shared_expert_ids"]
+            if expert_ids.shape[0] != expected_tokens or expert_ids.ndim != 3:
+                raise ValueError(
+                    f"unexpected expert route shape {expert_ids.shape} in {route_path}"
+                )
+            if prompt_token_ids.shape != (expected_tokens,):
+                raise ValueError(
+                    f"unexpected prompt token shape {prompt_token_ids.shape}"
+                )
+            if route_shape is None:
+                route_shape = expert_ids.shape
+                num_cases = len(manifest_rows)
+                counts_by_case = np.zeros(
+                    (num_cases, route_shape[1], 256), dtype=np.int64
+                )
+                aggregate_counts = np.zeros((route_shape[1], 256), dtype=np.int64)
+            elif expert_ids.shape != route_shape:
+                raise ValueError(
+                    f"route shape changed from {route_shape} to {expert_ids.shape}"
+                )
+            assert counts_by_case is not None
+            assert aggregate_counts is not None
+            if expert_ids.size and (expert_ids.min() < 0 or expert_ids.max() >= 256):
+                raise ValueError(f"invalid expert ID in {route_path}")
+            for layer in range(expert_ids.shape[1]):
+                counts = np.bincount(expert_ids[:, layer, :].reshape(-1), minlength=256)
+                counts_by_case[row_index, layer] = counts
+                aggregate_counts[layer] += counts
+            row["shape"] = list(expert_ids.shape)
+            row["shared_expert_ids"] = shared_expert_ids.tolist()
+            manifest_file.write(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+
+    assert route_shape is not None
+    assert counts_by_case is not None
+    assert aggregate_counts is not None
+    np.save(route_dir / "expert_counts_by_case.npy", counts_by_case)
+    np.save(route_dir / "expert_counts_by_layer.npy", aggregate_counts)
+    with (route_dir / "expert_counts_by_layer.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(("layer", "expert_id", "token_assignments"))
+        for layer, layer_counts in enumerate(aggregate_counts):
+            for expert_id, count in enumerate(layer_counts):
+                writer.writerow((layer, expert_id, int(count)))
+
+    assignments_per_layer = route_shape[0] * route_shape[2] * len(manifest_rows)
+    summary = {
+        "schema_version": 1,
+        "case_count": len(manifest_rows),
+        "route_shape_per_case": list(route_shape),
+        "routed_expert_count": 256,
+        "shared_expert_ids": manifest_rows[0]["shared_expert_ids"],
+        "assignments_per_layer": assignments_per_layer,
+        "all_layers_complete": bool(
+            np.all(aggregate_counts.sum(axis=1) == assignments_per_layer)
+        ),
+        "top_experts_by_layer": [
+            [
+                {"expert_id": int(expert_id), "count": int(layer_counts[expert_id])}
+                for expert_id in np.argsort(layer_counts)[-10:][::-1]
+            ]
+            for layer_counts in aggregate_counts
+        ],
+        "manifest": str(manifest_path),
+    }
+    with (route_dir / "route_summary.json").open("w", encoding="utf-8") as file:
+        json.dump(summary, file, ensure_ascii=False, indent=2, sort_keys=True)
+        file.write("\n")
+    return {
+        "case_count": summary["case_count"],
+        "route_shape_per_case": summary["route_shape_per_case"],
+        "assignments_per_layer": summary["assignments_per_layer"],
+        "all_layers_complete": summary["all_layers_complete"],
+        "summary_file": str(route_dir / "route_summary.json"),
+    }
 
 
 def probe_cpu_frequencies(
@@ -169,6 +342,17 @@ def main() -> None:
     if args.profile_dir:
         llm_kwargs["profiler_config"] = build_profiler_config(args.profile_dir)
 
+    route_dir = (
+        Path(args.route_capture_dir).resolve() if args.route_capture_dir else None
+    )
+    control_path = route_dir / "capture_control.json" if route_dir else None
+    if route_dir is not None:
+        route_dir.mkdir(parents=True, exist_ok=True)
+        assert control_path is not None
+        control_path.unlink(missing_ok=True)
+        os.environ[ROUTE_CAPTURE_DIR_ENV] = str(route_dir)
+        os.environ[ROUTE_CAPTURE_CONTROL_ENV] = str(control_path)
+
     print(f"model={args.model}")
     print(f"cases={len(cases)} x {args.expected_prompt_tokens} tokens")
     profile_status = (
@@ -177,6 +361,7 @@ def main() -> None:
         else "disabled"
     )
     print(f"profile={profile_status}")
+    print(f"route_capture={route_dir if route_dir is not None else 'disabled'}")
     llm = LLM(**llm_kwargs)
     sampling_params = SamplingParams(
         temperature=0,
@@ -188,9 +373,16 @@ def main() -> None:
 
     warmup = cases[args.warmup_case_index]
     warmup_start = time.perf_counter_ns()
-    llm.generate(
-        [TokensPrompt(prompt_token_ids=warmup["prompt_token_ids"])],
+    _, warmup_route_path = run_with_route_capture(
+        llm,
+        TokensPrompt(prompt_token_ids=warmup["prompt_token_ids"]),
         sampling_params,
+        route_dir=route_dir,
+        control_path=control_path,
+        phase="warmup",
+        request_index=0,
+        source_case_index=args.warmup_case_index,
+        case=warmup,
     )
     warmup_s = (time.perf_counter_ns() - warmup_start) / 1e9
     print(f"warmup case={warmup['case_id']} duration_s={warmup_s:.6f} excluded=true")
@@ -202,12 +394,13 @@ def main() -> None:
             raise ValueError("--repeat-measured-case-index is out of range")
         if args.repeat_measured_case_count <= 0:
             raise ValueError("--repeat-measured-case-count must be positive")
-        measurement_cases = [cases[args.repeat_measured_case_index]] * (
-            args.repeat_measured_case_count
-        )
+        measurement_cases = [
+            (args.repeat_measured_case_index, cases[args.repeat_measured_case_index])
+            for _ in range(args.repeat_measured_case_count)
+        ]
     else:
         measurement_cases = [
-            case
+            (index, case)
             for index, case in enumerate(cases)
             if not args.exclude_warmup_case or index != args.warmup_case_index
         ]
@@ -220,6 +413,18 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     durations = []
+    route_manifest_rows: list[dict[str, object]] = []
+    if warmup_route_path is not None:
+        route_manifest_rows.append(
+            {
+                "phase": "warmup",
+                "request_index": 0,
+                "source_case_index": args.warmup_case_index,
+                "case_id": warmup["case_id"],
+                "title": warmup["title"],
+                "route_file": warmup_route_path.name,
+            }
+        )
     frequency_cpu_groups = None
     if args.frequency_probe_cpus:
         frequency_cpu_groups = [
@@ -237,7 +442,7 @@ def main() -> None:
         llm.start_profile()
     try:
         with output.open("w", encoding="utf-8") as f:
-            for index, case in enumerate(measurement_cases):
+            for index, (source_case_index, case) in enumerate(measurement_cases):
                 if args.request_interval_seconds:
                     time.sleep(args.request_interval_seconds)
                 frequency_samples: list[list[float]] = []
@@ -256,9 +461,16 @@ def main() -> None:
                     )
                     frequency_thread.start()
                 start_ns = time.perf_counter_ns()
-                outputs = llm.generate(
-                    [TokensPrompt(prompt_token_ids=case["prompt_token_ids"])],
+                outputs, route_path = run_with_route_capture(
+                    llm,
+                    TokensPrompt(prompt_token_ids=case["prompt_token_ids"]),
                     sampling_params,
+                    route_dir=route_dir,
+                    control_path=control_path,
+                    phase="measured",
+                    request_index=index,
+                    source_case_index=source_case_index,
+                    case=case,
                 )
                 end_ns = time.perf_counter_ns()
                 if frequency_thread is not None:
@@ -280,6 +492,18 @@ def main() -> None:
                     "duration_s": duration_s,
                     "input_tokens_per_s": len(case["prompt_token_ids"]) / duration_s,
                 }
+                if route_path is not None:
+                    row["route_capture_file"] = route_path.name
+                    route_manifest_rows.append(
+                        {
+                            "phase": "measured",
+                            "request_index": index,
+                            "source_case_index": source_case_index,
+                            "case_id": case["case_id"],
+                            "title": case["title"],
+                            "route_file": route_path.name,
+                        }
+                    )
                 if frequency_samples:
                     frequency_array = np.asarray(frequency_samples)
                     row["frequency_mhz"] = [
@@ -324,6 +548,14 @@ def main() -> None:
         if args.profile_dir:
             llm.stop_profile()
 
+    route_summary = None
+    if route_dir is not None:
+        route_summary = summarize_route_captures(
+            route_dir,
+            route_manifest_rows,
+            args.expected_prompt_tokens,
+        )
+
     summary = {
         "schema_version": 1,
         "model": args.model,
@@ -336,6 +568,8 @@ def main() -> None:
         "warmup_excluded": True,
         "request_interval_seconds": args.request_interval_seconds,
         "profile_dir": os.path.abspath(args.profile_dir) if args.profile_dir else None,
+        "route_capture_dir": str(route_dir) if route_dir is not None else None,
+        "route_capture_summary": route_summary,
         "avg_duration_s": float(np.mean(durations)),
         "p95_duration_s": float(np.percentile(durations, 95, method="linear")),
         "min_duration_s": float(np.min(durations)),

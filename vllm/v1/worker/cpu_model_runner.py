@@ -144,6 +144,11 @@ class CPUModelRunner(GPUModelRunner):
             self.drafter.load_model(self.model)
 
         self._setup_eagle3_aux_hidden_state_outputs()
+        from vllm.model_executor.layers.fused_moe.file_route_recorder import (
+            maybe_bind_file_route_recorder,
+        )
+
+        maybe_bind_file_route_recorder(self.model, self.vllm_config)
 
     def get_model(self) -> nn.Module:
         return self.model

@@ -4,6 +4,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,6 +12,10 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.file_route_recorder import (
+    FileRouteRecorder,
+    write_route_control,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     RoutedExpertsManager,
@@ -427,3 +432,58 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
     unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
 
     assert "routed experts capture" not in unsupported
+
+
+def test_file_route_recorder_saves_prompt_routes(tmp_path):
+    control_path = tmp_path / "control.json"
+    write_route_control(
+        control_path,
+        {
+            "capture_id": "case-1",
+            "output_file": "case-1.npz",
+            "case_id": "case-1",
+            "prompt_token_ids": [10, 11, 12],
+        },
+    )
+    recorder = FileRouteRecorder(
+        tmp_path,
+        control_path,
+        num_layers=2,
+        num_experts=8,
+        experts_per_token=2,
+        num_shared_experts=1,
+    )
+
+    recorder.capture(0, torch.tensor([[1, 2], [3, 4], [5, 6]]))
+    assert not (tmp_path / "case-1.npz").exists()
+    recorder.capture(1, torch.tensor([[2, 3], [4, 5], [6, 7]]))
+
+    with np.load(tmp_path / "case-1.npz", allow_pickle=False) as payload:
+        assert payload["expert_ids"].shape == (3, 2, 2)
+        assert payload["expert_ids"][:, 0].tolist() == [[1, 2], [3, 4], [5, 6]]
+        assert payload["expert_ids"][:, 1].tolist() == [[2, 3], [4, 5], [6, 7]]
+        assert payload["prompt_token_ids"].tolist() == [10, 11, 12]
+        assert payload["shared_expert_ids"].tolist() == [8]
+
+
+def test_file_route_recorder_rejects_invalid_expert_id(tmp_path):
+    control_path = tmp_path / "control.json"
+    write_route_control(
+        control_path,
+        {
+            "capture_id": "bad",
+            "output_file": "bad.npz",
+            "prompt_token_ids": [10],
+        },
+    )
+    recorder = FileRouteRecorder(
+        tmp_path,
+        control_path,
+        num_layers=1,
+        num_experts=8,
+        experts_per_token=2,
+        num_shared_experts=0,
+    )
+
+    with pytest.raises(ValueError, match="expert IDs"):
+        recorder.capture(0, torch.tensor([[1, 8]]))
