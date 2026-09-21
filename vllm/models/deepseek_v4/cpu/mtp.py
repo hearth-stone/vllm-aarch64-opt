@@ -39,6 +39,7 @@ from .ops import rms_norm
 logger = init_logger(__name__)
 
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+_MTP_WEIGHT_RE = re.compile(r"(?:^|\.)mtp\.\d+\.")
 
 
 class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
@@ -270,11 +271,47 @@ class DeepSeekV4MTP(nn.Module):
             return name.replace(f"model.layers.{spec_layer}.", "model.")
         return name
 
+    def _prepare_weight_stream(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        tp_rank: int,
+        tp_size: int,
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        if not getattr(self.config, "cpu_fp8_to_int8", False):
+            return weights
+
+        from .fp8_requant import convert_fp8_checkpoint_for_cpu_w8a8
+
+        block_size = tuple(
+            getattr(self.config, "cpu_fp8_source_block_size", (128, 128))
+        )
+        rows_per_chunk = int(
+            getattr(self.config, "cpu_fp8_conversion_rows_per_chunk", 2048)
+        )
+        mtp_weights = (
+            (name, weight)
+            for name, weight in weights
+            if _MTP_WEIGHT_RE.search(name) is not None
+        )
+        return convert_fp8_checkpoint_for_cpu_w8a8(
+            mtp_weights,
+            block_size=typing.cast(tuple[int, int], block_size),
+            rows_per_chunk=rows_per_chunk,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
+        weights = self._prepare_weight_stream(
+            weights,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+        )
         local_heads = self.config.num_attention_heads // tp_size
         head_start = local_heads * tp_rank
         head_end = head_start + local_heads

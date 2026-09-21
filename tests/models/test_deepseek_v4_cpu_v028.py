@@ -40,6 +40,7 @@ from vllm.models.deepseek_v4.cpu.model import (
     DeepseekV4MoE,
     _configure_cpu_router_gate,
 )
+from vllm.models.deepseek_v4.cpu.mtp import DeepSeekV4MTP
 from vllm.models.deepseek_v4.cpu.ops import (
     gather_paged_cache,
     save_compressor_states,
@@ -581,6 +582,43 @@ def test_fp8_checkpoint_stream_converts_supported_targets_only():
     assert converted["layers.0.attn.wq_a.weight"].dtype is torch.bfloat16
     assert "layers.0.attn.wq_a.scale" not in converted
     assert converted["layers.0.attn_norm.weight"] is norm
+
+
+def test_mtp_loader_converts_only_its_fp8_weight_stream():
+    mtp = object.__new__(DeepSeekV4MTP)
+    torch.nn.Module.__init__(mtp)
+    mtp.config = SimpleNamespace(
+        cpu_fp8_to_int8=True,
+        cpu_fp8_source_block_size=(2, 2),
+        cpu_fp8_conversion_rows_per_chunk=2,
+    )
+    fp8 = torch.tensor([[1.0, -2.0], [3.0, 4.0]]).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5]], dtype=torch.float32)
+
+    converted = dict(
+        mtp._prepare_weight_stream(
+            [
+                ("layers.0.attn.wq_b.scale", scale),
+                ("layers.0.attn.wq_b.weight", fp8),
+                ("mtp.0.attn.wq_b.scale", scale),
+                ("mtp.0.attn.wq_b.weight", fp8),
+                ("mtp.0.attn.wq_a.weight", fp8),
+                ("mtp.0.attn.wq_a.scale", scale),
+                ("mtp.0.ffn.experts.3.w2.scale", scale),
+                ("mtp.0.ffn.experts.3.w2.weight", fp8),
+            ],
+            tp_rank=0,
+            tp_size=1,
+        )
+    )
+
+    assert "layers.0.attn.wq_b.weight" not in converted
+    assert converted["mtp.0.attn.wq_b.weight"].dtype is torch.int8
+    assert converted["mtp.0.attn.wq_b.weight_scale"].shape == (2, 1)
+    assert converted["mtp.0.attn.wq_a.weight"].dtype is torch.bfloat16
+    assert "mtp.0.attn.wq_a.scale" not in converted
+    assert converted["mtp.0.ffn.experts.3.w2.weight"].dtype is torch.int8
+    assert converted["mtp.0.ffn.experts.3.w2.weight_scale"].shape == (2, 1)
 
 
 def test_pro_cpu_w8a8_targets_and_ignore_config_cover_even_indexers():
