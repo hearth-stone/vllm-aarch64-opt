@@ -64,6 +64,7 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         # here would destroy the canonical [N, K] weight/scale layout before
         # the joint prepare hook runs.
         if getattr(layer, "_cpu_fused_cpp_joint_int8_owned", False):
+            self.linear_method = self._raise_unprepared_joint_int8
             return
         w_q_name, _, _, _, _ = self.layer_param_names
         weight = getattr(layer, w_q_name)
@@ -88,6 +89,18 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     ) -> torch.Tensor:
         w_q_name, _, _, _, _ = self.layer_param_names
         return torch.nn.functional.linear(x, getattr(layer, w_q_name), bias)
+
+    def _raise_unprepared_joint_int8(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del layer, x, bias
+        raise RuntimeError(
+            "DeepSeek V4 CPU INT8 projection was not prepared by its "
+            "fused_cpp joint owner"
+        )
 
     def process_weights_for_onednn(self, layer: torch.nn.Module) -> None:
         # WEIGHT

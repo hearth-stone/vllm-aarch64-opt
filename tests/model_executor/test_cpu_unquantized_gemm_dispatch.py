@@ -197,3 +197,25 @@ def test_mtp_int8_linear_dequantizes_once_to_bf16():
     x = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
     output = kernel.apply_weights(layer, x)
     torch.testing.assert_close(output, torch.nn.functional.linear(x, expected_weight))
+
+
+def test_joint_int8_linear_fails_closed_until_owner_prepares_weights():
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.ones(2, 2, dtype=torch.int8), requires_grad=False),
+    )
+    layer._cpu_fused_cpp_joint_int8_owned = True
+
+    kernel = object.__new__(CPUInt8ScaledMMLinearKernel)
+    kernel.layer_param_names = (
+        "weight",
+        "weight_scale",
+        "input_scale",
+        "input_zero_point",
+        "azp_adj",
+    )
+    kernel.process_weights_after_loading(layer)
+
+    with pytest.raises(RuntimeError, match="not prepared by its fused_cpp joint owner"):
+        kernel.apply_weights(layer, torch.ones(1, 2, dtype=torch.bfloat16))

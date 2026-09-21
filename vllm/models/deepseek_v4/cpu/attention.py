@@ -1072,6 +1072,22 @@ class DeepseekV4CPUAttention(nn.Module, AttentionLayerBase):
         if self._weights_prepared:
             return
 
+        joint_int8_modules = [self.wq_b, self.wo_b]
+        if self.indexer is not None:
+            joint_int8_modules.append(self.indexer.wq_b)
+        requires_fused_w8a8 = any(
+            getattr(module, "_cpu_fused_cpp_joint_int8_owned", False)
+            and isinstance((weight := getattr(module, "weight", None)), torch.Tensor)
+            and weight.dtype == torch.int8
+            and weight.numel() > 0
+            for module in joint_int8_modules
+        )
+
+        def fail_or_fallback(reason: str, cause: Exception | None = None) -> None:
+            self._fused_disabled_reason = reason
+            if envs.VLLM_CPU_FUSED_CPP_STRICT or requires_fused_w8a8:
+                raise RuntimeError(reason) from cause
+
         try:
             from fused_cpp import (
                 deepseek_v4_attn_gemm_fused as attn_gemm_ops,
@@ -1106,15 +1122,11 @@ class DeepseekV4CPUAttention(nn.Module, AttentionLayerBase):
             )
             from fused_cpp.sparse_mla import flash_mla_sparse_fwd
         except (ImportError, AttributeError) as exc:
-            self._fused_disabled_reason = f"fused_cpp import failed: {exc}"
-            if envs.VLLM_CPU_FUSED_CPP_STRICT:
-                raise RuntimeError(self._fused_disabled_reason) from exc
+            fail_or_fallback(f"fused_cpp import failed: {exc}", exc)
             return
 
         if not attn_gemm_ops._HAS_DEEPSEEK_V4_ATTN_GEMM_FUSED:
-            self._fused_disabled_reason = "attention input fused kernel is unavailable"
-            if envs.VLLM_CPU_FUSED_CPP_STRICT:
-                raise RuntimeError(self._fused_disabled_reason)
+            fail_or_fallback("attention input fused kernel is unavailable")
             return
         self._fused_ops = {
             "input": attn_gemm_ops.deepseek_v4_attn_gemm_fused_prepacked,
@@ -1183,9 +1195,7 @@ class DeepseekV4CPUAttention(nn.Module, AttentionLayerBase):
                 )
             )
         except (RuntimeError, TypeError, ValueError) as exc:
-            self._fused_disabled_reason = f"input preparation failed: {exc}"
-            if envs.VLLM_CPU_FUSED_CPP_STRICT:
-                raise RuntimeError(self._fused_disabled_reason) from exc
+            fail_or_fallback(f"input preparation failed: {exc}", exc)
             return
 
         main_weight = getattr(self.wq_b, "weight", None)

@@ -238,6 +238,25 @@ class DeepseekV4MoE(nn.Module):
         )
         return True
 
+    def ensure_joint_int8_experts_prepared(self) -> None:
+        """Reject INT8 shared experts not consumed by the fused MoE backend."""
+        if self.shared_experts is None:
+            return
+        projections = (
+            self.shared_experts.gate_up_proj,
+            self.shared_experts.down_proj,
+        )
+        if any(
+            isinstance((weight := getattr(module, "weight", None)), torch.Tensor)
+            and weight.dtype == torch.int8
+            and weight.numel() > 0
+            for module in projections
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 CPU INT8 routed and shared experts require "
+                "fused_cpp Plan V2 preparation"
+            )
+
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -882,6 +901,7 @@ class DeepseekV4ForCausalLM(
                 module.process_weights_after_loading()
             elif isinstance(module, DeepseekV4MoE):
                 module.disable_placeholder_hash_routing()
+                module.ensure_joint_int8_experts_prepared()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

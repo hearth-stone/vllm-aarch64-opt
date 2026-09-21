@@ -6,6 +6,7 @@ import importlib
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
@@ -78,6 +79,44 @@ def test_attention_post_load_hook_accepts_dtype_and_is_idempotent():
     attention = object.__new__(DeepseekV4CPUAttention)
     attention._weights_prepared = True
     attention.process_weights_after_loading(torch.bfloat16)
+
+
+def test_attention_joint_int8_requires_fused_cpp_even_when_non_strict(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_CPU_FUSED_CPP_STRICT", "0")
+    monkeypatch.setitem(sys.modules, "fused_cpp", None)
+    attention = object.__new__(DeepseekV4CPUAttention)
+    torch.nn.Module.__init__(attention)
+    attention._weights_prepared = False
+    attention.indexer = None
+    attention.wq_b = torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+    attention.wo_b = torch.nn.Module()
+    attention.wo_b.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.ones(2, 2, dtype=torch.int8), requires_grad=False),
+    )
+    attention.wo_b._cpu_fused_cpp_joint_int8_owned = True
+
+    with pytest.raises(RuntimeError, match="fused_cpp import failed"):
+        attention.process_weights_after_loading()
+
+
+def test_int8_shared_experts_require_fused_moe_preparation():
+    moe = object.__new__(DeepseekV4MoE)
+    torch.nn.Module.__init__(moe)
+    projection = torch.nn.Module()
+    projection.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.ones(2, 2, dtype=torch.int8), requires_grad=False),
+    )
+    moe.shared_experts = SimpleNamespace(
+        gate_up_proj=projection,
+        down_proj=torch.nn.Linear(2, 2, bias=False, dtype=torch.bfloat16),
+    )
+
+    with pytest.raises(RuntimeError, match="require fused_cpp Plan V2 preparation"):
+        moe.ensure_joint_int8_experts_prepared()
 
 
 def test_cpu_sqrtsoftplus_routing_matches_v028_reference():
