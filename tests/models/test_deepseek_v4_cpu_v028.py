@@ -762,3 +762,69 @@ def test_pre_sharded_linear_and_moe_loaders_do_not_slice_twice(monkeypatch):
     )
     torch.testing.assert_close(destination[:2], local)
     assert torch.count_nonzero(destination[2:]) == 0
+
+
+def _deepseek_v4_model_config():
+    from pathlib import Path
+
+    from vllm.config import ModelConfig
+
+    model_dir = (
+        Path(__file__).resolve().parents[2] / "model_configs" / "DeepSeek-V4-Flash-BF16"
+    )
+    return ModelConfig(
+        model=str(model_dir),
+        skip_tokenizer_init=True,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        max_model_len=4096,
+        enforce_eager=True,
+    )
+
+
+def _apply_cpu_prefix_cache_config(model_config, *, enable_prefix_caching: bool):
+    from vllm.config import CacheConfig, DeviceConfig, SchedulerConfig, VllmConfig
+
+    # VllmConfig construction runs the current platform update. Reset the
+    # flags under test, then call the shipped CPU update directly.
+    config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(enable_prefix_caching=enable_prefix_caching),
+        scheduler_config=SchedulerConfig.default_factory(
+            max_model_len=model_config.max_model_len,
+            max_num_batched_tokens=128,
+            enable_chunked_prefill=True,
+        ),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    config.cache_config.enable_prefix_caching = enable_prefix_caching
+    config.scheduler_config.enable_chunked_prefill = True
+    config.scheduler_config.max_num_batched_tokens = 128
+    CpuPlatform.check_and_update_config(config)
+    return config
+
+
+def test_deepseek_v4_cpu_prefix_caching_stays_enabled():
+    import copy
+
+    model = _deepseek_v4_model_config()
+    assert model.hf_config.model_type == "deepseek_v4"
+    assert model.use_mla is True
+
+    enabled = _apply_cpu_prefix_cache_config(model, enable_prefix_caching=True)
+    assert enabled.cache_config.enable_prefix_caching is True
+    assert enabled.scheduler_config.enable_chunked_prefill is False
+    assert enabled.scheduler_config.max_num_batched_tokens == 4096
+
+    disabled = _apply_cpu_prefix_cache_config(model, enable_prefix_caching=False)
+    assert disabled.cache_config.enable_prefix_caching is False
+    assert disabled.scheduler_config.enable_chunked_prefill is False
+
+    other = copy.copy(model)
+    other.hf_config = copy.copy(model.hf_config)
+    other.hf_text_config = other.hf_config
+    other.hf_config.model_type = "deepseek_v3"
+    assert other.use_mla is True
+    other_mla = _apply_cpu_prefix_cache_config(other, enable_prefix_caching=True)
+    assert other_mla.cache_config.enable_prefix_caching is False
+    assert other_mla.scheduler_config.enable_chunked_prefill is False

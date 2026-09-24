@@ -369,12 +369,22 @@ class CpuPlatform(Platform):
         )
 
         if model_config is not None and model_config.use_mla:
-            logger.info_once(
-                "MLA is enabled on a non-GPU platform; forcing chunked "
-                "prefill and prefix caching to be disabled."
-            )
+            # CPU MLA has no chunked-prefill kernel. Generic CPU MLA also has
+            # no prefix-cache path. DeepSeek V4 attention reads paged history
+            # by absolute position, so a requested prefix cache stays enabled.
             vllm_config.scheduler_config.enable_chunked_prefill = False
-            vllm_config.cache_config.enable_prefix_caching = False
+            if is_deepseek_v4:
+                logger.info_once(
+                    "DeepSeek V4 on CPU disables chunked prefill; "
+                    "prefix caching remains %s.",
+                    vllm_config.cache_config.enable_prefix_caching,
+                )
+            else:
+                logger.info_once(
+                    "MLA is enabled on a non-GPU platform; forcing chunked "
+                    "prefill and prefix caching to be disabled."
+                )
+                vllm_config.cache_config.enable_prefix_caching = False
             vllm_config.scheduler_config.max_num_batched_tokens = max(
                 vllm_config.model_config.max_model_len,
                 vllm_config.scheduler_config.DEFAULT_MAX_NUM_BATCHED_TOKENS,
