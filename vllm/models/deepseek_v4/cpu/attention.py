@@ -785,11 +785,12 @@ class DeepseekV4CPUAttention(nn.Module, AttentionLayerBase):
             )
             prefill = self._c4_prefill_metadata(positions, indexer_meta, swa_metadata)
             if prefill is None:
-                if envs.VLLM_CPU_FUSED_CPP_STRICT:
-                    raise RuntimeError(
-                        "required fused_cpp C4A post stage supports "
-                        "prefill-only batches"
-                    )
+                # The packed C4A post kernel only accepts a pure prefill batch.
+                # Decode and mixed batches use the Torch Q/RoPE/indexer path.
+                logger.warning_once(
+                    "DeepSeek V4 C4A fused post is prefill-only; "
+                    "decode and mixed batches use the Torch post path."
+                )
                 return None
         try:
             swa = self._fused_ops["SWAState"](
@@ -1320,10 +1321,8 @@ class DeepseekV4CPUAttention(nn.Module, AttentionLayerBase):
                 release(self.indexer.compressor.fused_wkv_wgate)
                 release(self.indexer.weights_proj)
             release(self.wo_a)
-            if self._fused_post_weights is not None:
-                release(self.wq_b)
-                if self.indexer is not None:
-                    release(self.indexer.wq_b)
+            # wq_b and indexer.wq_b stay resident. Prefill uses the packed
+            # post weights; decode multiplies these raw tensors in Torch.
         if self._fused_wo_b_w8a8 is not None:
             release(self.wo_b, ("weight", "weight_scale"))
 

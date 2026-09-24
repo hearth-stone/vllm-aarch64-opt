@@ -374,6 +374,34 @@ def test_compressor_states_persist_in_page_padded_cache():
     torch.testing.assert_close(storage, expected)
 
 
+def test_strict_c4a_decode_post_returns_to_torch(monkeypatch):
+    monkeypatch.setenv("VLLM_CPU_FUSED_CPP_STRICT", "1")
+    attention = object.__new__(DeepseekV4CPUAttention)
+    attention._fused_post_weights = object()
+    attention._fused_ops = {}
+    attention.compress_ratio = 4
+    attention.prefix = "layers.0.self_attn"
+    attention.indexer = SimpleNamespace(k_cache=SimpleNamespace(prefix="indexer.k"))
+    attention.swa_cache_layer = SimpleNamespace(prefix="swa")
+    metadata = {
+        "swa": SimpleNamespace(num_decode_tokens=1, num_prefill_tokens=0),
+        "layers.0.self_attn": SimpleNamespace(),
+        "indexer.k": SimpleNamespace(),
+    }
+
+    result = attention._execute_fused_post(
+        torch.empty(1, 4),
+        torch.empty(1, 8),
+        None,
+        None,
+        None,
+        torch.tensor([8]),
+        metadata,
+    )
+
+    assert result is None
+
+
 def test_strict_swa_metadata_skips_unused_prefill_index_matrix(monkeypatch):
     monkeypatch.setenv("VLLM_CPU_FUSED_CPP_STRICT", "1")
     spec = SimpleNamespace(sliding_window=8, block_size=4)
