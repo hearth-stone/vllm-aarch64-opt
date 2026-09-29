@@ -18,19 +18,22 @@ export MMLU_WORKDIR="$HOME/dsv4-mmlu"
 export HARNESS_DIR="$MMLU_WORKDIR/lm-evaluation-harness"
 export DATASET_DIR="$MMLU_WORKDIR/cais-mmlu"
 export TASK_DIR="$MMLU_WORKDIR/tasks/mmlu-local"
-export MMLU_PYTHON="$MMLU_WORKDIR/.venv/bin/python"
 mkdir -p "$MMLU_WORKDIR"
 ```
 
 ## 2. 用 uv 创建独立评测环境
 
-克隆 lm-evaluation-harness 并固定到本文检查过的提交。它的 `[api]` extra 包含 HTTP 请求所需依赖；评测进程通过服务端 tokenizer 接口工作，无需在评测环境中安装 vLLM 或加载模型权重。[uv 虚拟环境与安装文档](https://docs.astral.sh/uv/pip/environments/)
+克隆 lm-evaluation-harness 并固定到本文检查过的提交。先让 `uv` 安装 Python 3.12 并创建虚拟环境，再设置 `MMLU_PYTHON`；这个路径在创建环境之前并不存在。`[api]` extra 包含 HTTP 请求所需依赖；评测进程通过服务端 tokenizer 接口工作，无需在评测环境中安装 vLLM 或加载模型权重。[uv 虚拟环境与安装文档](https://docs.astral.sh/uv/pip/environments/)
 
 ```bash
 git clone https://github.com/EleutherAI/lm-evaluation-harness.git "$HARNESS_DIR"
 git -C "$HARNESS_DIR" checkout c1c4bea3777f73e188395264083adcf454913344
 
+uv python install 3.12
 uv venv --python 3.12 "$MMLU_WORKDIR/.venv"
+export MMLU_PYTHON="$MMLU_WORKDIR/.venv/bin/python"
+test -x "$MMLU_PYTHON"
+"$MMLU_PYTHON" --version
 uv pip install --python "$MMLU_PYTHON" -e "${HARNESS_DIR}[api]"
 "$MMLU_WORKDIR/.venv/bin/lm-eval" --help > /dev/null
 ```
