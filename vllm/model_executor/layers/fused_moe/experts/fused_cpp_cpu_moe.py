@@ -3,6 +3,7 @@
 """Arm fused_cpp Plan V2 experts for vLLM's modular MoE pipeline."""
 
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, ClassVar
@@ -22,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+    RoutingMethodType,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -49,6 +51,8 @@ _BACKEND_ABI = "fused_cpp-482e03e-plan-v2"
 _RUNTIME_LOCK = threading.Lock()
 _RUNTIME: Any | None = None
 _RUNTIME_SIGNATURE: tuple[Any, ...] | None = None
+_AUTO_PROFILE_DIR: tempfile.TemporaryDirectory | None = None
+_AUTO_PROFILE: tuple[str, tuple[int, ...]] | None = None
 
 
 def _load_fused_cpp_moe() -> Any | None:
@@ -96,14 +100,61 @@ def _rank_cpu_ids(tp_rank: int) -> tuple[int, ...] | None:
     return cpu_ids or None
 
 
+def _calibrate_temp_profile(
+    moe: Any, tp_rank: int, cpu_ids: tuple[int, ...]
+) -> tuple[str, tuple[int, ...]]:
+    import fcntl
+
+    global _AUTO_PROFILE_DIR
+    lock_name = f"vllm-dsv4-moe-calibration-{os.getuid()}.lock"
+    lock_path = Path(tempfile.gettempdir()) / lock_name
+    with lock_path.open("a") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        profile_dir = tempfile.TemporaryDirectory(
+            prefix=f"vllm-dsv4-moe-rank{tp_rank}-", dir=tempfile.gettempdir()
+        )
+        profile_path = Path(profile_dir.name) / "calibration.json"
+        try:
+            logger.info(
+                "Calibrating DeepSeek V4 MoE for TP rank %d on CPUs %s; profile=%s",
+                tp_rank,
+                cpu_ids,
+                profile_path,
+            )
+            result = moe.calibrate_moe_planner_quick(cpu_ids, output=profile_path)
+        except Exception:
+            profile_dir.cleanup()
+            raise
+    _AUTO_PROFILE_DIR = profile_dir
+    logger.info(
+        "DeepSeek V4 MoE calibration for TP rank %d finished in %.1f seconds",
+        tp_rank,
+        result.elapsed_seconds,
+    )
+    return str(profile_path), tuple(result.cpu_ids)
+
+
+def _runtime_profile(
+    moe: Any, tp_rank: int, cpu_ids: tuple[int, ...]
+) -> tuple[str, tuple[int, ...]]:
+    global _AUTO_PROFILE
+    profile = _profile_path(tp_rank)
+    if profile is not None:
+        return profile, cpu_ids
+    if os.environ.get(_PROFILE_ENV):
+        raise RuntimeError(
+            f"{_PROFILE_ENV} must name an existing rank-local Plan V2 profile"
+        )
+    if _AUTO_PROFILE is None:
+        _AUTO_PROFILE = _calibrate_temp_profile(moe, tp_rank, cpu_ids)
+    return _AUTO_PROFILE
+
+
 def _runtime_for(layer: torch.nn.Module, moe: Any) -> Any:
     global _RUNTIME, _RUNTIME_SIGNATURE
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
-    profile = _profile_path(tp_rank)
     cpu_ids = _rank_cpu_ids(tp_rank)
-    if profile is None:
-        raise RuntimeError(f"{_PROFILE_ENV} must name a rank-local Plan V2 profile")
     if cpu_ids is None:
         raise RuntimeError(
             "Plan V2 requires an explicit VLLM_CPU_OMP_THREADS_BIND per rank"
@@ -117,16 +168,17 @@ def _runtime_for(layer: torch.nn.Module, moe: Any) -> Any:
     intermediate = int(layer.w2_weight.shape[2])
     local_experts = int(layer.w13_weight.shape[0])
     global_experts = int(layer.global_num_experts)
-    signature = (
-        profile,
-        hidden,
-        intermediate,
-        local_experts,
-        global_experts,
-        tp_size,
-        cpu_ids,
-    )
     with _RUNTIME_LOCK:
+        profile, cpu_ids = _runtime_profile(moe, tp_rank, cpu_ids)
+        signature = (
+            profile,
+            hidden,
+            intermediate,
+            local_experts,
+            global_experts,
+            tp_size,
+            cpu_ids,
+        )
         if _RUNTIME is not None:
             if signature != _RUNTIME_SIGNATURE:
                 raise RuntimeError("Plan V2 runtime signature changed within one rank")
@@ -331,7 +383,10 @@ class FusedCppArmExperts(mk.FusedMoEExpertsModular):
             current_platform.is_cpu()
             and current_platform.get_cpu_architecture() == CpuArchEnum.ARM
             and _load_fused_cpp_moe() is not None
-            and _profile_path(get_tensor_model_parallel_rank()) is not None
+            and (
+                not os.environ.get(_PROFILE_ENV)
+                or _profile_path(get_tensor_model_parallel_rank()) is not None
+            )
             and _rank_cpu_ids(get_tensor_model_parallel_rank()) is not None
         )
 
@@ -348,6 +403,14 @@ class FusedCppArmExperts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
         return activation == MoEActivation.SILU
+
+    @staticmethod
+    def _supports_routing_method(
+        routing_method: RoutingMethodType,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return routing_method == RoutingMethodType.DeepseekV4
 
     @staticmethod
     def _supports_parallel_config(config: FusedMoEParallelConfig) -> bool:
@@ -530,7 +593,10 @@ class _FusedCppArmInt8Experts(FusedCppArmExperts):
             current_platform.is_cpu()
             and current_platform.get_cpu_architecture() == CpuArchEnum.ARM
             and moe is not None
-            and _profile_path(get_tensor_model_parallel_rank()) is not None
+            and (
+                not os.environ.get(_PROFILE_ENV)
+                or _profile_path(get_tensor_model_parallel_rank()) is not None
+            )
             and _rank_cpu_ids(get_tensor_model_parallel_rank()) is not None
         )
 

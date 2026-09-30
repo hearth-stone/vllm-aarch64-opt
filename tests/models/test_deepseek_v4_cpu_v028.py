@@ -4,6 +4,7 @@
 
 import importlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from safetensors.torch import save_file
 import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.experts import fused_cpp_cpu_moe
 from vllm.model_executor.layers.fused_moe.experts.fused_cpp_cpu_moe import (
     FusedCppArmExperts,
@@ -541,6 +543,97 @@ def test_fused_cpp_prepack_key_covers_rank_shapes_quant_and_abi(monkeypatch):
     assert key["routed_w13_shape"] == (8, 16, 4)
     assert key["shared_w2_scale_shape"] == (4, 1)
     assert key["quant_mode"] == "W8A8"
+
+
+def test_fused_cpp_calibrates_rank_in_system_tmp(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def calibrate(cpu_ids, *, output):
+        calls.append((cpu_ids, output))
+        Path(output).write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(cpu_ids=tuple(reversed(cpu_ids)), elapsed_seconds=0.25)
+
+    monkeypatch.setattr(fused_cpp_cpu_moe.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(fused_cpp_cpu_moe, "_AUTO_PROFILE_DIR", None)
+    moe = SimpleNamespace(calibrate_moe_planner_quick=calibrate)
+
+    profile, cpu_ids = fused_cpp_cpu_moe._calibrate_temp_profile(moe, 2, (80, 81))
+    try:
+        assert Path(profile).is_file()
+        assert Path(profile).parent.parent == tmp_path
+        assert cpu_ids == (81, 80)
+        assert calls == [((80, 81), Path(profile))]
+    finally:
+        fused_cpp_cpu_moe._AUTO_PROFILE_DIR.cleanup()
+
+
+def test_fused_cpp_failed_calibration_cleans_temp_profile(monkeypatch, tmp_path: Path):
+    def calibrate(cpu_ids, *, output):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(fused_cpp_cpu_moe.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(fused_cpp_cpu_moe, "_AUTO_PROFILE_DIR", None)
+    moe = SimpleNamespace(calibrate_moe_planner_quick=calibrate)
+
+    with pytest.raises(RuntimeError, match="probe failed"):
+        fused_cpp_cpu_moe._calibrate_temp_profile(moe, 2, (80, 81))
+    assert not list(tmp_path.glob("vllm-dsv4-moe-rank2-*"))
+
+
+def test_fused_cpp_auto_profile_is_reused(monkeypatch, tmp_path: Path):
+    calls = []
+    profile = str(tmp_path / "rank2.json")
+
+    def calibrate(moe, tp_rank, cpu_ids):
+        calls.append((tp_rank, cpu_ids))
+        return profile, cpu_ids
+
+    monkeypatch.delenv("FUSED_CPP_MOE_PLANNER_PROFILE", raising=False)
+    monkeypatch.setattr(fused_cpp_cpu_moe, "_AUTO_PROFILE", None)
+    monkeypatch.setattr(fused_cpp_cpu_moe, "_calibrate_temp_profile", calibrate)
+
+    assert fused_cpp_cpu_moe._runtime_profile(None, 2, (80, 81)) == (
+        profile,
+        (80, 81),
+    )
+    assert fused_cpp_cpu_moe._runtime_profile(None, 2, (80, 81)) == (
+        profile,
+        (80, 81),
+    )
+    assert calls == [(2, (80, 81))]
+
+
+def test_fused_cpp_explicit_profile_skips_calibration(monkeypatch, tmp_path: Path):
+    profile = tmp_path / "rank2.json"
+    profile.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv(
+        "FUSED_CPP_MOE_PLANNER_PROFILE", str(tmp_path / "rank{tp_rank}.json")
+    )
+
+    assert fused_cpp_cpu_moe._runtime_profile(None, 2, (80, 81)) == (
+        str(profile),
+        (80, 81),
+    )
+
+
+def test_fused_cpp_missing_explicit_profile_fails(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("FUSED_CPP_MOE_PLANNER_PROFILE", str(tmp_path / "missing.json"))
+
+    with pytest.raises(RuntimeError, match="must name an existing rank-local"):
+        fused_cpp_cpu_moe._runtime_profile(None, 2, (80, 81))
+
+
+@pytest.mark.parametrize(
+    "experts_cls",
+    [FusedCppArmExperts, fused_cpp_cpu_moe.FusedCppArmW8A8Experts],
+)
+def test_fused_cpp_auto_calibration_only_selects_deepseek_v4(experts_cls):
+    assert experts_cls._supports_routing_method(
+        RoutingMethodType.DeepseekV4, None, None
+    )
+    assert not experts_cls._supports_routing_method(
+        RoutingMethodType.Default, None, None
+    )
 
 
 def test_block_fp8_conversion_produces_int8_per_channel_and_bf16():

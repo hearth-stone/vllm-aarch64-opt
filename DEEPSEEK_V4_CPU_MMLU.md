@@ -137,16 +137,14 @@ GIT_LFS_SKIP_SMUDGE=1 git -C "$DATASET_DIR" checkout \
 
 `arm-codex-internal` 无法直接连接 `huggingface.co`，上面的镜像下载方式在目标机通过了 176 个 Parquet 文件的检查；下载脚本会重试残留的 Git LFS 指针。`prepare_tasks.py` 复制 lm-eval 自带的 MMLU 配置并改为本地数据集路径。
 
-## 5. 校准并启动 BF16 服务
+## 5. 启动 BF16 服务（自动校准）
 
-当前推送的 vLLM 分支需要每个 TP rank 的 MoE profile。先为 NUMA 4–7 的 4 组 40 核生成 profile，然后直接启动 API server。两种精度共用这组 profile；仓库里名称含 `autocalib` 的启动脚本会清掉 profile 变量，因此此处不用它们。目标机还需已有 `/mnt/models/DeepSeek-V4-Flash-BF16/` 和 `/mnt/models/DeepSeek-V4-Flash-INT8/`。
+BF16 和 INT8 启动时会自动校准，无需先运行 `calibrate_profiles.py`。每个 worker 校准一次，各层复用结果，文件默认保存在 `/tmp/vllm-dsv4-moe-rank<rank>-*/calibration.json`。目标机需已有 `/mnt/models/DeepSeek-V4-Flash-BF16/` 和 `/mnt/models/DeepSeek-V4-Flash-INT8/`。
+
+如需复用已有 profile，设置 `FUSED_CPP_MOE_PLANNER_PROFILE` 即可；下面使用默认的自动校准流程。
 
 ```bash
-export PROFILE_DIR="$FINAL_TEST/profiles/mmlu40"
-PYTHONPATH="$FUSED_CPP_SRC:$VLLM_ROOT" OMP_NUM_THREADS=40 \
-  "$VLLM_PYTHON" "$VLLM_ROOT/scripts/mmlu/calibrate_profiles.py" \
-  --output-dir "$PROFILE_DIR" --first-cpu 160 \
-  --rank-count 4 --threads-per-rank 40
+unset FUSED_CPP_MOE_PLANNER_PROFILE
 
 export PYTHONPATH="$FUSED_CPP_SRC:$VLLM_ROOT"
 export LD_PRELOAD=/usr/lib64/libjemalloc.so
@@ -158,7 +156,6 @@ export VLLM_CPU_OMP_THREADS_BIND='160-199|200-239|240-279|280-319'
 export OMP_NUM_THREADS=40 MKL_NUM_THREADS=40 NUMEXPR_MAX_THREADS=40
 export OPENBLAS_NUM_THREADS=40 VECLIB_MAXIMUM_THREADS=40 GOTO_NUM_THREADS=40
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=36000
-export FUSED_CPP_MOE_PLANNER_PROFILE="$PROFILE_DIR/rank{local_rank}.json"
 
 export MODEL_ID=dsv4-flash-bf16
 export RUN_DIR="$FINAL_TEST/results/bf16-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -231,7 +228,7 @@ ls -R "$RUN_DIR/full"
 
 ## 7. 切换到 W8A8 INT8
 
-BF16 评测结束后停止服务，使用相同的环境和 profile 在端口 8004 启动 W8A8 INT8。以下命令保存到新的结果目录：
+BF16 评测结束后停止服务，使用相同的环境在端口 8004 启动 W8A8 INT8。新 worker 会自动生成自己的临时校准文件。以下命令保存到新的结果目录：
 
 ```bash
 kill "$(cat "$RUN_DIR/server.pid")"
