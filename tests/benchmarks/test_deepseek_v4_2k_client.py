@@ -99,6 +99,8 @@ def test_http_run_records_requests_timing_order_and_excludes_warmup(
                 "1",
                 "--seed",
                 "19",
+                "--prepack-cache-version",
+                "v028-482e03e",
                 "--interval-seconds",
                 "5",
                 "--base-url",
@@ -110,6 +112,7 @@ def test_http_run_records_requests_timing_order_and_excludes_warmup(
     folder = tmp_path / "result"
     run = json.loads((folder / "requests.json").read_text())
     rows = run["requests"]
+    assert run["protocol"]["prepack_cache_version"] == "v028-482e03e"
     expected = client.select_cases(client.DEFAULT_DATASET, 3, 19)
     assert rc == 0
     assert [r["case_id"] for r in rows] == [c["case_id"] for c in expected]

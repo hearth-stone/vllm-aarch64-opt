@@ -18,6 +18,44 @@
 
 ## 请求服务
 
+在 Arm-codex-internal 上测试已有 Flash BF16 prepack cache 时，先将
+`scripts/serve_deepseek_v4_cpu.sh` 中的模型选择为
+`/mnt/models/DeepSeek-V4-Flash-BF16`，然后在一个终端启动：
+
+```bash
+nice -n -20 bash /home/zhangxu/final_test/vllm-aarch64-opt/scripts/serve_deepseek_v4_cpu.sh
+```
+
+API、engine、rank 和新建线程继承 NI=-20。当前账户已验证可以设置该优先级。
+启动脚本直接读取仓库内的
+[TP4 固定校准表](../../profiles/deepseek_v4/arm-codex-tp4-80cores/README.md)，
+路径为 `$vllm_root/benchmarks/profiles/deepseek_v4/arm-codex-tp4-80cores/rank{tp_rank}.json`，
+并配置：
+
+```bash
+# Flash BF16 TP4 的已有专家权重预打包缓存。
+export VLLM_CPU_MOE_PREPACKED_DIR=/mnt/models/.cache/zhangxu/DeepSeek-V4-Flash-BF16-moe-prepacked-v028-482e03e
+# 加载缓存时提前触碰权重页。
+export VLLM_CPU_MOE_PREPACK_PREFAULT=1
+```
+
+cache 版本标记为 `v028-482e03e`，它不是当前 fused_cpp 的 Git 提交号。
+INT8 和 Pro 不复用这份 BF16 cache。服务 `/health` 返回 200 后，在另一个终端
+先测少量输入：
+
+```bash
+cd /home/zhangxu/final_test/vllm-aarch64-opt
+source /home/zhangxu/final_test/test/bin/activate
+python scripts/benchmark_deepseek_v4_2k.py \
+    --requests 5 --interval-seconds 5 --seed 42 --warmup 3 \
+    --prepack-cache-version v028-482e03e \
+    --output-dir /home/zhangxu/final_test/perf-2k-prepacked-$(date +%Y%m%d-%H%M%S)
+```
+
+`--prepack-cache-version` 将调用者提供的版本保存到 `requests.json` 的
+`protocol.prepack_cache_version`，不启用或检查服务端缓存。
+cache 和 prefault 必须在启动服务时设置；请求脚本的环境变量不会改变已经运行的服务。
+
 在 vLLM 仓库根目录执行，先启动模型服务并确认 `/health` 返回 200：
 
 ```bash
@@ -39,6 +77,7 @@ python scripts/benchmark_deepseek_v4_2k.py \
 | `--seed` | 随机打乱输入的种子；同一值可复现顺序 | 0 |
 | `--warmup` | 测量前重复第一条选中输入的预热次数，不计入统计 | 3 |
 | `--timeout-seconds` | 单次 HTTP 请求超时秒数 | 240 |
+| `--prepack-cache-version` | 保存服务使用的 cache 版本标记，不启用或校验缓存 | 未设置 |
 | `--dataset` | 输入 JSONL 文件，默认自动定位本目录的数据 | 仓库内数据 |
 | `--output-dir` | 新建结果目录，不覆盖已有目录 | 请求模式必填 |
 | `--analyze` | 离线读取已有 `requests.json` 重算统计，不发送请求 | 未设置 |

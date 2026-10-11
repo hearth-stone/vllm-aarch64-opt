@@ -132,6 +132,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0, help="固定种子可复现请求顺序")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=float, default=240)
+    parser.add_argument(
+        "--prepack-cache-version",
+        help="记录服务使用的 prepack cache 版本；不启用或校验服务端缓存",
+    )
     parser.add_argument("--output-dir", type=Path, help="新建结果目录，不覆盖已有目录")
     args = parser.parse_args(argv)
     if args.analyze:
@@ -172,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         "output_tokens": 1,
         "case_order": [case["case_id"] for case in cases],
     }
+    if args.prepack_cache_version:
+        protocol["prepack_cache_version"] = args.prepack_cache_version
     run = {"protocol": protocol, "requests": [], "warmups": [], "interrupted": False}
     result_file = args.output_dir / "requests.json"
     write_json(result_file, run)
