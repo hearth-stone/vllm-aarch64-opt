@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Focused tests for the v0.28 DeepSeek V4 CPU platform package."""
 
-import importlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,14 +58,22 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 def test_cpu_package_does_not_import_platform_gpu_model_modules():
-    importlib.import_module("vllm.models.deepseek_v4.cpu")
-    forbidden = (
-        "vllm.models.deepseek_v4.nvidia.model",
-        "vllm.models.deepseek_v4.amd.model",
-        "vllm.models.deepseek_v4.xpu.model",
-        "vllm.model_executor.kernels.mhc.tilelang",
-    )
-    assert all(name not in sys.modules for name in forbidden)
+    import subprocess
+
+    code = """
+import importlib
+import sys
+
+importlib.import_module("vllm.models.deepseek_v4.cpu")
+forbidden = (
+    "vllm.models.deepseek_v4.nvidia.model",
+    "vllm.models.deepseek_v4.amd.model",
+    "vllm.models.deepseek_v4.xpu.model",
+    "vllm.model_executor.kernels.mhc.tilelang",
+)
+assert all(name not in sys.modules for name in forbidden)
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_cpu_platform_selects_v4_sparse_mla_backend():
@@ -106,8 +113,20 @@ def test_attention_joint_int8_requires_fused_cpp_even_when_non_strict(
 
 
 def test_int8_shared_experts_require_fused_moe_preparation():
+    class FusedCppExpertsStub:
+        pass
+
     moe = object.__new__(DeepseekV4MoE)
     torch.nn.Module.__init__(moe)
+    moe.experts = SimpleNamespace(
+        routed_experts=SimpleNamespace(
+            quant_method=SimpleNamespace(
+                moe_kernel=SimpleNamespace(
+                    impl=SimpleNamespace(fused_experts=FusedCppExpertsStub())
+                )
+            )
+        )
+    )
     projection = torch.nn.Module()
     projection.register_parameter(
         "weight",
@@ -432,6 +451,65 @@ def test_strict_swa_metadata_skips_unused_prefill_index_matrix(monkeypatch):
     assert metadata.num_decode_tokens == 0
     assert metadata.prefill_swa_indices is None
     assert metadata.prefill_gather_lens.tolist() == [4]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("invalid_last_token", [False, True])
+def test_mixed_swa_metadata_preserves_prefill_rows_for_attention(
+    monkeypatch, strict, invalid_last_token
+):
+    monkeypatch.setenv("VLLM_CPU_FUSED_CPP_STRICT", str(int(strict)))
+    spec = SimpleNamespace(sliding_window=8, block_size=4)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+    builder = DeepseekV4CPUSWAMetadataBuilder(
+        spec, ["layer"], config, torch.device("cpu")
+    )
+    query_start = torch.tensor([0, 1, 5], dtype=torch.int32)
+    positions = torch.tensor([8, 0, 1, 2, 3], dtype=torch.int64)
+    cm = CommonAttentionMetadata(
+        query_start_loc=query_start,
+        query_start_loc_cpu=query_start,
+        seq_lens=torch.tensor([9, 4], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=5,
+        max_query_len=4,
+        max_seq_len=9,
+        block_table_tensor=torch.tensor([[2, 3, 4], [6, 0, 0]], dtype=torch.int32),
+        slot_mapping=torch.tensor(
+            [16, 24, 25, 26, -1 if invalid_last_token else 27], dtype=torch.int64
+        ),
+        positions=positions,
+    )
+    metadata = builder.build(0, cm)
+    assert metadata.num_decode_tokens == 1
+    assert metadata.num_prefill_tokens == 4
+    torch.testing.assert_close(
+        metadata.decode_swa_indices[0], torch.arange(9, 17, dtype=torch.int32)
+    )
+    assert metadata.prefill_swa_indices is not None
+    assert metadata.prefill_swa_lens is not None
+    expected = torch.full((4, 8), -1, dtype=torch.int32)
+    for index in range(4):
+        if index != 3 or not invalid_last_token:
+            expected[index, : index + 1] = torch.arange(24, 25 + index)
+    torch.testing.assert_close(metadata.prefill_swa_indices, expected)
+    torch.testing.assert_close(
+        metadata.prefill_swa_lens,
+        torch.tensor([1, 2, 3, 0 if invalid_last_token else 4], dtype=torch.int32),
+    )
+    attention = object.__new__(DeepseekV4CPUAttention)
+    torch.nn.Module.__init__(attention)
+    attention.compress_ratio = 1
+    cache = torch.arange(64, dtype=torch.float32).reshape(8, 4, 2)
+    attention.swa_cache_layer = SimpleNamespace(kv_cache=cache)
+    rows = attention._candidate_rows(4, positions, metadata, None, None)
+    expected_rows = cache[6, : 0 if invalid_last_token else 4]
+    torch.testing.assert_close(rows, expected_rows)
 
 
 def test_sparse_mla_reference_includes_sink_denominator():
@@ -921,3 +999,84 @@ def test_deepseek_v4_cpu_prefix_caching_stays_enabled():
     other_mla = _apply_cpu_prefix_cache_config(other, enable_prefix_caching=True)
     assert other_mla.cache_config.enable_prefix_caching is False
     assert other_mla.scheduler_config.enable_chunked_prefill is False
+
+
+def test_arm_cpu_int8_moe_accepts_deepseek_v4_routing():
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+        ArmCPUExpertsInt8,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kInt8DynamicTokenSym,
+        kInt8StaticChannelSym,
+    )
+
+    assert ArmCPUExpertsInt8._supports_routing_method(
+        RoutingMethodType.DeepseekV4,
+        kInt8StaticChannelSym,
+        kInt8DynamicTokenSym,
+    )
+    assert not ArmCPUExpertsInt8._supports_routing_method(
+        RoutingMethodType.Unspecified,
+        kInt8StaticChannelSym,
+        kInt8DynamicTokenSym,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_fused", [False, True])
+def test_sparse_candidate_chunks_bound_gathers_and_preserve_query_order(
+    dtype: torch.dtype, use_fused: bool
+) -> None:
+    """Long mixed batches retain at most 32 query gathers and keep global slots."""
+    generator = torch.Generator().manual_seed(35)
+    q = torch.randn(65, 2, 8, generator=generator).to(dtype)
+    rows = [
+        torch.randn(1 + token % 5, 8, generator=generator).to(dtype)
+        for token in range(q.shape[0])
+    ]
+    sink = torch.tensor([-0.2, 0.3])
+    scale = 0.5
+    expected = torch.empty_like(q)
+    for token, keys in enumerate(rows):
+        logits = q[token].double() @ keys.double().t() * scale
+        logits = torch.cat((logits, sink.double()[:, None]), dim=-1)
+        probabilities = torch.exp(logits - torch.logsumexp(logits, dim=-1)[:, None])
+        values = torch.cat((keys.double(), torch.zeros(1, 8, dtype=torch.float64)))
+        expected[token] = (probabilities @ values).to(dtype)
+
+    positions = torch.arange(q.shape[0])
+    swa = SimpleNamespace(num_decode_tokens=1)
+    topk = torch.arange(q.shape[0])[:, None]
+    gathered, pending, call_sizes = [], [], []
+
+    def candidate(token, actual_positions, actual_swa, sparse, actual_topk):
+        assert actual_positions is positions and actual_swa is swa
+        assert sparse is None and actual_topk is topk
+        gathered.append(token)
+        pending.append(token)
+        assert len(pending) <= 32
+        return rows[token]
+
+    def fused(query_chunk, key_rows, output_chunk):
+        assert len(key_rows) == len(pending) == query_chunk.shape[0]
+        torch.testing.assert_close(query_chunk, q[pending], rtol=0, atol=0)
+        call_sizes.append(len(key_rows))
+        if use_fused:
+            sparse_mla_reference(query_chunk, key_rows, scale, sink, output_chunk)
+        pending.clear()
+        return use_fused
+
+    layer = SimpleNamespace(
+        _candidate_rows=candidate,
+        _run_fused_sparse=fused,
+        scale=scale,
+        attn_sink=sink,
+    )
+    output = torch.empty_like(q)
+    DeepseekV4CPUAttention._run_sparse_candidates(
+        layer, q, positions, swa, None, topk, output
+    )
+    assert gathered == list(range(q.shape[0]))
+    assert call_sizes == [32, 32, 1]
+    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-5, atol=1e-5)

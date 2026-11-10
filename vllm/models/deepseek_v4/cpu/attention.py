@@ -901,6 +901,32 @@ class DeepseekV4CPUAttention(nn.Module, AttentionLayerBase):
             )
             return False
 
+    def _run_sparse_candidates(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        swa_metadata: DeepseekV4CPUSWAMetadata,
+        sparse_metadata: DeepseekV4CPUSparseMLAMetadata | None,
+        indexer_topk: torch.Tensor | None,
+        out: torch.Tensor,
+    ) -> None:
+        # Mixed batches replicate cached keys per query before concatenation.
+        # Bound these live copies instead of gathering an entire long prefill.
+        query_chunk_size = 32
+        for start in range(0, q.shape[0], query_chunk_size):
+            end = min(start + query_chunk_size, q.shape[0])
+            rows = [
+                self._candidate_rows(
+                    token, positions, swa_metadata, sparse_metadata, indexer_topk
+                )
+                for token in range(start, end)
+            ]
+            if not self._run_fused_sparse(q[start:end], rows, out[start:end]):
+                sparse_mla_reference(
+                    q[start:end], rows, self.scale, self.attn_sink, out[start:end]
+                )
+            del rows
+
     def _run_fused_prefill(
         self,
         q: torch.Tensor,
@@ -1410,18 +1436,9 @@ class DeepseekV4CPUAttention(nn.Module, AttentionLayerBase):
         ):
             return self._o_proj(o, positions)
 
-        candidate_rows = [
-            self._candidate_rows(
-                token,
-                positions,
-                swa_metadata,
-                sparse_metadata,
-                indexer_topk,
-            )
-            for token in range(q.shape[0])
-        ]
-        if not self._run_fused_sparse(q, candidate_rows, o):
-            sparse_mla_reference(q, candidate_rows, self.scale, self.attn_sink, o)
+        self._run_sparse_candidates(
+            q, positions, swa_metadata, sparse_metadata, indexer_topk, o
+        )
         return self._o_proj(o, positions)
 
     def forward(
