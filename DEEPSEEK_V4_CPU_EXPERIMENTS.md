@@ -97,6 +97,20 @@ ssh Arm-codex-internal '
 
 ## 4. 公共运行环境
 
+### 在线服务的自动校准
+
+`run.sh` 和 `run_numa_*.sh` 不再要求预先生成 MoE planner profile。若未设置
+`FUSED_CPP_MOE_PLANNER_PROFILE`，各 TP rank 会在首次初始化 fused_cpp MoE 时，
+针对该 rank 的 `VLLM_CPU_OMP_THREADS_BIND` CPU 列表执行 quick calibration，并在
+系统默认临时目录中新建目录保存 `calibration.json`。跨 rank 使用文件锁串行校准；
+worker 正常退出时清理其临时目录。因此首次启动会增加校准时间，每次重启也会重新校准。
+
+若要复用既有校准结果，仍可在启动前显式设置
+`FUSED_CPP_MOE_PLANNER_PROFILE='/path/rank{local_rank}.json'`。指定的每个文件
+必须存在，且其中的 ordered CPU 列表必须与对应 rank 的绑定一致；错误配置会在
+启动阶段失败。正式性能实验继续使用下面的预校准 profile，以避免启动过程测量和
+其他 rank 的初始化相互干扰。
+
 以下变量用于所有 BF16/INT8 实验：
 
 ```bash

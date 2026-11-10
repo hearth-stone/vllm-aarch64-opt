@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """随机排序串行请求 DeepSeek V4 服务，统计 2K 输入的 E2E 延迟。"""
 
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -195,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"{label} {row['case_id']}: {row['e2e_s']:.4f}s "
                 f"{'OK' if row['success'] else row['error']}",
+                end="  ",
                 flush=True,
             )
             if not row["success"]:
@@ -207,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
     write_json(result_file, run)
     summary = analyze_results(run)
     write_json(args.output_dir / "summary.json", summary)
+    print()
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return 0 if summary["complete"] else 1
 

@@ -1,60 +1,64 @@
 # DeepSeek V4 Flash CPU MMLU 评测
 
-本文从空目录克隆 vLLM 与 AOT fused_cpp，安装服务环境和独立的 MMLU 环境，再通过 vLLM Completions 服务运行 5-shot MMLU。命令面向 `arm-codex-internal` 的 Linux AArch64、NUMA 4–7，默认在同一个 Bash shell 中依次执行。BF16 和 W8A8 INT8 分开启动，结果分别保存。
+在 `arm-codex-internal` 上评测 BF16 和 W8A8 INT8，保存 MMLU 汇总准确率和逐题结果。第 1–3 节完成一次安装和数据准备。第 4、5 节分别是独立的 BF16、INT8 评测流程，可以各自在新的 Bash 会话中执行；每一节内的命令在该会话中按顺序执行。两种服务共用端口 8004，运行下一种前先停止当前服务。
 
-工作区另有 `bench/mmlu/bench_s.sh`，但它面向 DeepSeek-V2，写死了旧服务地址和 tokenizer 路径，还会调用 `pip` 安装依赖；不要直接拿它评测这里的 v0.28.0 服务。本流程使用 [lm-evaluation-harness 的 `local-completions` 后端](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/docs/API_guide.md)，因为 MMLU 是需要候选答案 loglikelihood 的多选任务，Chat Completions 后端不适用。
+## 系统如何工作
 
-## 1. 克隆代码与安装系统依赖
+两套 Python 环境分工如下：
 
-系统要求 GCC/G++ 12.3 及以上、CMake、Ninja、NUMA 开发库、jemalloc、Git、Git LFS 和 curl。`arm-codex-internal` 已有这些工具；新机器按发行版安装其中一组：
+| 目录（均在 `$HOME/final_test` 下） | 用途 |
+| --- | --- |
+| `vllm-aarch64-opt/`、`fused_cpp/` | 服务代码和 CPU 内核 |
+| `test/` | 安装 vLLM、fused_cpp，加载模型并提供 HTTP 服务 |
+| `mmlu/.venv/` | 安装 lm-evaluation-harness，读取题目并请求服务 |
+| `mmlu/cais-mmlu/` | 本地 MMLU Parquet 数据 |
+| `mmlu/tasks/mmlu-local/` | 指向本地数据的评测任务配置 |
+| `results/` | 服务日志、评分接口响应、评测结果 |
+
+数据流：本地题目 → lm-eval 构造 5-shot 提示和候选答案 → vLLM Completions 接口返回选项的 token logprobs → lm-eval 评分 → JSON/JSONL。评测器使用服务端 tokenizer，不在 MMLU 环境里加载模型。
+
+本流程固定使用测试机的以下约定：
+
+- Linux AArch64、SVE 256 位；GCC/G++ ≥ 12.3。
+- TP4，每个 worker 使用 NUMA 4/5/6/7 中的一组 40 核：`160-199`、`200-239`、`240-279`、`280-319`。
+- 模型已在 `/mnt/models/DeepSeek-V4-Flash-BF16/` 和 `/mnt/models/DeepSeek-V4-Flash-INT8/`。
+- 服务地址 `http://127.0.0.1:8004`，上下文长度 4096；BF16 与 INT8 依次运行。
+- 评测固定为 5-shot、单请求并发；评测器和数据集固定到下面的提交。
+
+## 1. 安装服务环境
+
+测试机已有系统依赖。重装系统时用这一组命令准备：
 
 ```bash
-# openEuler
 sudo dnf install -y gcc gcc-c++ jemalloc numactl numactl-devel \
   cmake ninja-build git git-lfs curl
-
-# Ubuntu：仅在 Ubuntu 上执行
-sudo apt-get update
-sudo apt-get install -y gcc g++ libjemalloc2 libjemalloc-dev \
-  numactl libnuma-dev cmake ninja-build git git-lfs curl
-
 gcc --version
 g++ --version
-git lfs version
 ```
 
-在测试机遇到 HTTPS 克隆的 HTTP/2 错误时，可以先运行 `git config --global http.version HTTP/1.1`。克隆本次使用的两个分支，目录和虚拟环境都放在 `final_test`：
+克隆两个交付分支：
 
 ```bash
-export FINAL_TEST="$HOME/final_test"
-mkdir -p "$FINAL_TEST"
+mkdir -p "$HOME/final_test"
+cd "$HOME/final_test"
 git clone -b dsv4-arm-cpu-v0.28.0 --single-branch \
-  https://github.com/hearth-stone/vllm-aarch64-opt.git \
-  "$FINAL_TEST/vllm-aarch64-opt"
+  https://github.com/hearth-stone/vllm-aarch64-opt.git
 git clone -b feat/fused_cpp/dsv4_v028_aot_delivery --single-branch \
-  https://github.com/hearth-stone/fused_cpp.git "$FINAL_TEST/fused_cpp"
+  https://github.com/hearth-stone/fused_cpp.git
 
-export VLLM_ROOT="$FINAL_TEST/vllm-aarch64-opt"
-export FUSED_ROOT="$FINAL_TEST/fused_cpp"
-export FUSED_CPP_SRC="$FUSED_ROOT/src"
-git -C "$VLLM_ROOT" rev-parse HEAD
-git -C "$FUSED_ROOT" rev-parse HEAD
+export VLLM_ROOT="$HOME/final_test/vllm-aarch64-opt"
+export FUSED_CPP_SRC="$HOME/final_test/fused_cpp/src"
 ```
 
-第 8 节记录了已验证的源码提交；分支更新后应先核对这里打印的提交号。
-
-## 2. 安装 vLLM 与 fused_cpp
-
-两份代码共用一个 Python 3.12 虚拟环境。`arm-codex-internal` 已有 `uv`；新机器先运行安装命令。环境创建完成后才设置 `VLLM_PYTHON`。[uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/)
+安装 uv 并创建服务环境；已有 uv 时跳过前两行：
 
 ```bash
-# 已安装 uv 时跳过下面两行
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME/.local/bin/env"
 uv python install 3.12
-uv venv --python 3.12 "$FINAL_TEST/test"
-source "$FINAL_TEST/test/bin/activate"
-export VLLM_PYTHON="$FINAL_TEST/test/bin/python"
+uv venv --python 3.12 "$HOME/final_test/test"
+source "$HOME/final_test/test/bin/activate"
+export VLLM_PYTHON="$HOME/final_test/test/bin/python"
 
 cd "$VLLM_ROOT"
 uv pip install -r requirements/build/cpu.txt --torch-backend cpu \
@@ -66,223 +70,234 @@ uv pip install -r requirements/cpu.txt --torch-backend cpu \
 VLLM_TARGET_DEVICE=cpu MAX_JOBS=16 uv pip install -e . --no-build-isolation
 uv pip uninstall torchcodec
 
-cd "$FUSED_ROOT"
+cd "$HOME/final_test/fused_cpp"
 FUSED_CPP_SVE_VECTOR_BITS=256 MAX_JOBS=16 \
   uv pip install -e . --no-build-isolation --no-deps
 uv pip install pytest tblib
 ```
 
-这里选择 256 位 SVE 构建，与测试机的运行长度相同。`torchcodec` 在测试机的 CPU requirements 安装后导入时需要缺失的 `libnvrtc.so.13`；本流程只评测文本，移除后已验证服务能启动。确认当前环境导入的是刚克隆的两份代码：
+移除 `torchcodec` 是因为测试机装入的 wheel 导入时缺少 `libnvrtc.so.13`；这套流程只评测文本。
+
+启动脚本要求传入 `VLLM_ROOT`、`VLLM_PYTHON`、`FUSED_CPP_SRC`。这三个路径在已有的 `codex` 部署和新建的 `final_test` 环境中不同，因此由调用者指定。NUMA、网卡 `eno1`、jemalloc 路径和模型位置已经固定在启动脚本里，无需另行配置。
+
+## 2. 验证代码安装
 
 ```bash
-PYTHONPATH="$FUSED_CPP_SRC:$VLLM_ROOT" "$VLLM_PYTHON" -c \
-  'import fused_cpp, vllm; print(fused_cpp.__file__); print(vllm.__file__)'
-```
+cd "$HOME/final_test/fused_cpp"
+PYTHONPATH="$FUSED_CPP_SRC:$VLLM_ROOT" "$VLLM_PYTHON" -m pytest -q -rs tests/
 
-## 3. 测试关键 kernel
-
-运行你列出的三个 fused_cpp 测试文件；`PYTHONPATH` 指向本次克隆，避免导入机器上的旧安装：
-
-```bash
-cd "$FUSED_ROOT"
-PYTHONPATH="$FUSED_CPP_SRC:$VLLM_ROOT" "$VLLM_PYTHON" -m pytest -q -rs \
-  tests/test_fused_moe_bf16_tiled.py \
-  tests/test_deepseek_v4_attn_gemm_fused.py \
-  tests/test_deepseek_v4_inv_rope_woa.py
-```
-
-vLLM 的 DeepSeek V4 CPU 专项测试需要模型配置文件。目标机已有权重时，可以接着运行：
-
-```bash
 mkdir -p "$VLLM_ROOT/model_configs/DeepSeek-V4-Flash-BF16"
 cp /mnt/models/DeepSeek-V4-Flash-BF16/config.json \
   "$VLLM_ROOT/model_configs/DeepSeek-V4-Flash-BF16/config.json"
 cd "$VLLM_ROOT"
 VLLM_TARGET_DEVICE=cpu PYTHONPATH="$FUSED_CPP_SRC:$VLLM_ROOT" \
   "$VLLM_PYTHON" -m pytest -q -rs \
-  tests/models/test_deepseek_v4_cpu_v028.py
+  tests/models/test_deepseek_v4_cpu_v028.py \
+  tests/model_executor/test_cpu_unquantized_gemm_dispatch.py
 ```
 
-## 4. 创建独立的 MMLU 环境与数据集
+当前交付版实测：fused_cpp 为 `1582 passed, 1 skipped`，vLLM 为 `45 passed`。唯一的 skip 测试“native backend 不可用”时的报错；本机构建已有 native backend，所以跳过。
 
-MMLU 评测器使用另一个 Python 3.12 环境，通过服务端 tokenizer 和 Completions 接口评分。先创建环境，再设置 `MMLU_PYTHON`；固定评测器与数据集提交，以便两种精度使用同一套题目。
+## 3. 安装 MMLU 环境与数据
+
+MMLU 环境单独创建，不把 lm-eval 装进服务环境。`MMLU_PYTHON` 是创建环境后用于执行命令的 shell 变量，没有预设值。
 
 ```bash
-export MMLU_WORKDIR="$FINAL_TEST/mmlu"
-export HARNESS_DIR="$MMLU_WORKDIR/lm-evaluation-harness"
-export DATASET_DIR="$MMLU_WORKDIR/cais-mmlu"
-export TASK_DIR="$MMLU_WORKDIR/tasks/mmlu-local"
-mkdir -p "$MMLU_WORKDIR"
-
-git clone https://github.com/EleutherAI/lm-evaluation-harness.git "$HARNESS_DIR"
-git -C "$HARNESS_DIR" checkout c1c4bea3777f73e188395264083adcf454913344
-uv venv --python 3.12 "$MMLU_WORKDIR/.venv"
-export MMLU_PYTHON="$MMLU_WORKDIR/.venv/bin/python"
-uv pip install --python "$MMLU_PYTHON" -e "${HARNESS_DIR}[api]"
+mkdir -p "$HOME/final_test/mmlu"
+cd "$HOME/final_test/mmlu"
+git clone https://github.com/EleutherAI/lm-evaluation-harness.git
+git -C lm-evaluation-harness checkout c1c4bea3777f73e188395264083adcf454913344
+uv venv --python 3.12 .venv
+MMLU_PYTHON="$HOME/final_test/mmlu/.venv/bin/python"
+uv pip install --python "$MMLU_PYTHON" -e './lm-evaluation-harness[api]'
 
 GIT_LFS_SKIP_SMUDGE=1 git clone \
-  https://hf-mirror.com/datasets/cais/mmlu "$DATASET_DIR"
-GIT_LFS_SKIP_SMUDGE=1 git -C "$DATASET_DIR" checkout \
+  https://hf-mirror.com/datasets/cais/mmlu cais-mmlu
+GIT_LFS_SKIP_SMUDGE=1 git -C cais-mmlu checkout \
   c30699e8356da336a370243923dbaf21066bb9fe
 "$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/download_dataset.py" \
-  --dataset-dir "$DATASET_DIR" \
-  --hf-cli "$MMLU_WORKDIR/.venv/bin/hf"
+  --dataset-dir "$HOME/final_test/mmlu/cais-mmlu" \
+  --hf-cli "$HOME/final_test/mmlu/.venv/bin/hf"
 "$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/check_dataset.py" \
-  --dataset-dir "$DATASET_DIR"
+  --dataset-dir "$HOME/final_test/mmlu/cais-mmlu"
 "$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/prepare_tasks.py" \
-  --harness-dir "$HARNESS_DIR" \
-  --dataset-dir "$DATASET_DIR" \
-  --task-dir "$TASK_DIR"
+  --harness-dir "$HOME/final_test/mmlu/lm-evaluation-harness" \
+  --dataset-dir "$HOME/final_test/mmlu/cais-mmlu" \
+  --task-dir "$HOME/final_test/mmlu/tasks/mmlu-local"
 ```
 
-`arm-codex-internal` 无法直接连接 `huggingface.co`，上面的镜像下载方式在目标机通过了 176 个 Parquet 文件的检查；下载脚本会重试残留的 Git LFS 指针。`prepare_tasks.py` 复制 lm-eval 自带的 MMLU 配置并改为本地数据集路径。
+测试机连接 `huggingface.co` 曾超时，所以这里直接使用已验证的镜像。检查应报告 176 个 Parquet 文件，`abstract_algebra` 的 `dev=5`、`test=100`。任务准备脚本将 lm-eval 的 MMLU 配置改为本地数据路径，评测时离线读取。
 
-## 5. 启动 BF16 服务（自动校准）
+## 4. BF16 + MMLU
 
-BF16 和 INT8 启动时会自动校准，无需先运行 `calibrate_profiles.py`。每个 worker 校准一次，各层复用结果，文件默认保存在 `/tmp/vllm-dsv4-moe-rank<rank>-*/calibration.json`。目标机需已有 `/mnt/models/DeepSeek-V4-Flash-BF16/` 和 `/mnt/models/DeepSeek-V4-Flash-INT8/`。
-
-如需复用已有 profile，设置 `FUSED_CPP_MOE_PLANNER_PROFILE` 即可；下面使用默认的自动校准流程。
+前提是第 1–3 节已完成，端口 8004 空闲。下面重新设置本节所需的环境变量，不依赖安装时或另一种模型评测时的 shell 状态；无需激活虚拟环境。启动脚本自动完成 MoE 校准，不需要手动准备 profile。
 
 ```bash
-unset FUSED_CPP_MOE_PLANNER_PROFILE
+export VLLM_ROOT="$HOME/final_test/vllm-aarch64-opt"
+export VLLM_PYTHON="$HOME/final_test/test/bin/python"
+export FUSED_CPP_SRC="$HOME/final_test/fused_cpp/src"
+MMLU_PYTHON="$HOME/final_test/mmlu/.venv/bin/python"
+model_id=dsv4-flash-bf16
+run_dir="$HOME/final_test/results/bf16-$(date -u +%Y%m%dT%H%M%SZ)"
 
-export PYTHONPATH="$FUSED_CPP_SRC:$VLLM_ROOT"
-export LD_PRELOAD=/usr/lib64/libjemalloc.so
-export MALLOC_CONF=thp:always,oversize_threshold:2097152,background_thread:true
-export GLOO_DEVICE_TRANSPORT=TCP GLOO_SOCKET_IFNAME=eno1
-export VLLM_CPU_KVCACHE_SPACE=10 VLLM_TARGET_DEVICE=cpu
-export VLLM_CPU_FUSED_CPP_STRICT=1
-export VLLM_CPU_OMP_THREADS_BIND='160-199|200-239|240-279|280-319'
-export OMP_NUM_THREADS=40 MKL_NUM_THREADS=40 NUMEXPR_MAX_THREADS=40
-export OPENBLAS_NUM_THREADS=40 VECLIB_MAXIMUM_THREADS=40 GOTO_NUM_THREADS=40
-export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=36000
-
-export MODEL_ID=dsv4-flash-bf16
-export RUN_DIR="$FINAL_TEST/results/bf16-$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$RUN_DIR"
-cd "$VLLM_ROOT"
-nohup "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server \
-  --model /mnt/models/DeepSeek-V4-Flash-BF16/ \
-  --host 127.0.0.1 --port 8004 \
-  --gpu-memory-utilization 0.95 --max-model-len 4096 \
-  --tensor-parallel-size 4 --dtype bfloat16 --trust-remote-code \
-  --numa-bind --numa-bind-nodes 4 5 6 7 \
-  --numa-bind-cpus 160-199 200-239 240-279 280-319 \
-  --served-model-name "$MODEL_ID" \
+mkdir -p "$run_dir"
+nohup bash "$VLLM_ROOT/run_numa_4567_bf16_autocalib.sh" \
+  --served-model-name "$model_id" \
   --enable-tokenizer-info-endpoint --no-enable-prefix-caching \
-  > "$RUN_DIR/server.log" 2>&1 < /dev/null &
-echo $! > "$RUN_DIR/server.pid"
+  > "$run_dir/server.log" 2>&1 < /dev/null &
+echo $! > "$run_dir/server.pid"
+tail -f "$run_dir/server.log"
 ```
 
-首次加载模型可能需要数分钟；确认服务就绪：
-
-```bash
-until curl -fsS -o /dev/null http://127.0.0.1:8004/v1/models; do
-  if ! kill -0 "$(cat "$RUN_DIR/server.pid")" 2>/dev/null; then
-    tail -n 60 "$RUN_DIR/server.log"
-    exit 1
-  fi
-  sleep 10
-done
-```
-
-## 6. 检查评分接口并运行 MMLU
-
-MMLU 使用 completion 端点的 `echo` 和 prompt token logprobs。普通生成请求成功，不等于这种评分请求也成功。脚本检查模型名、tokenizer 接口和 prompt logprobs，并保存原始响应：
+模型加载和权重准备需要数分钟。看到 `Application startup complete` 后按 Ctrl+C 退出日志查看，服务继续运行。检查评分接口：
 
 ```bash
 "$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/check_api.py" \
-  --model "$MODEL_ID" \
-  --output-dir "$RUN_DIR"
+  --model "$model_id" --output-dir "$run_dir"
 ```
 
-评测器走服务端 `/tokenize`、`/detokenize` 和 `/tokenizer_info`，因此 `tokenizer_backend=remote`。服务端脚本的最大上下文长度为 4096，客户端 `max_length` 与其保持一致。先用一个学科的两道题验证端到端流程；`--limit` 仅用于调试，不能把该结果当作完整 MMLU 成绩。[lm-eval 参数及结果输出说明](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/docs/interface.md)
+成功时打印 `Serving: dsv4-flash-bf16; prompt logprobs: 33 tokens`。然后运行 `abstract_algebra` 的两题 smoke：
 
 ```bash
 "$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/run_eval.py" \
-  --lm-eval "$MMLU_WORKDIR/.venv/bin/lm-eval" \
-  --harness-dir "$HARNESS_DIR" \
-  --dataset-dir "$DATASET_DIR" \
-  --task-dir "$TASK_DIR" \
-  --model "$MODEL_ID" \
-  --output-dir "$RUN_DIR" \
-  --mode smoke
+  --lm-eval "$HOME/final_test/mmlu/.venv/bin/lm-eval" \
+  --harness-dir "$HOME/final_test/mmlu/lm-evaluation-harness" \
+  --dataset-dir "$HOME/final_test/mmlu/cais-mmlu" \
+  --task-dir "$HOME/final_test/mmlu/tasks/mmlu-local" \
+  --model "$model_id" --output-dir "$run_dir" --mode smoke
 ```
 
-小样本成功后可运行全部 MMLU。`--output_path` 保存汇总 JSON；`--log_samples` 保存每题的请求、响应及评分信息。本次服务测试执行了小样本，没有执行完整 MMLU。
+smoke 通过后运行完整 MMLU：
 
 ```bash
 "$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/run_eval.py" \
-  --lm-eval "$MMLU_WORKDIR/.venv/bin/lm-eval" \
-  --harness-dir "$HARNESS_DIR" \
-  --dataset-dir "$DATASET_DIR" \
-  --task-dir "$TASK_DIR" \
-  --model "$MODEL_ID" \
-  --output-dir "$RUN_DIR" \
-  --mode full
-
-ls -R "$RUN_DIR/full"
+  --lm-eval "$HOME/final_test/mmlu/.venv/bin/lm-eval" \
+  --harness-dir "$HOME/final_test/mmlu/lm-evaluation-harness" \
+  --dataset-dir "$HOME/final_test/mmlu/cais-mmlu" \
+  --task-dir "$HOME/final_test/mmlu/tasks/mmlu-local" \
+  --model "$model_id" --output-dir "$run_dir" --mode full
 ```
 
-`$RUN_DIR/full/` 下的模型子目录包含 `results_*.json`（整体和各学科准确率）以及 `samples_*.jsonl`（逐题记录）；`$RUN_DIR` 中的 `full.log`、`server.log`、两个提交号、`models.json`、`tokenizer-info.json` 和 `completion-smoke.json` 用于复核运行配置。若日志提示上下文被截断，不要把该运行结果与更长上下文的 5-shot MMLU 结果直接比较；先增大服务端 `--max-model-len`，并给 `run_eval.py` 传相同的 `--max-length` 后重新运行。
-
-## 7. 切换到 W8A8 INT8
-
-BF16 评测结束后停止服务，使用相同的环境在端口 8004 启动 W8A8 INT8。新 worker 会自动生成自己的临时校准文件。以下命令保存到新的结果目录：
+结果保存在本节的 `run_dir`。评测完成后停止服务；只运行 smoke 时也用这组命令停止：
 
 ```bash
-kill "$(cat "$RUN_DIR/server.pid")"
-while kill -0 "$(cat "$RUN_DIR/server.pid")" 2>/dev/null; do sleep 1; done
+kill "$(cat "$run_dir/server.pid")"
+while kill -0 "$(cat "$run_dir/server.pid")" 2>/dev/null; do sleep 1; done
+```
 
-export MODEL_ID=dsv4-flash-int8
-export RUN_DIR="$FINAL_TEST/results/int8-$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$RUN_DIR"
-cd "$VLLM_ROOT"
-nohup "$VLLM_PYTHON" -m vllm.entrypoints.openai.api_server \
-  --model /mnt/models/DeepSeek-V4-Flash-INT8/ \
-  --host 127.0.0.1 --port 8004 \
-  --gpu-memory-utilization 0.95 --max-model-len 4096 \
-  --tensor-parallel-size 4 --dtype bfloat16 --trust-remote-code \
-  --quantization compressed-tensors \
-  --numa-bind --numa-bind-nodes 4 5 6 7 \
-  --numa-bind-cpus 160-199 200-239 240-279 280-319 \
-  --served-model-name "$MODEL_ID" \
+## 5. W8A8 INT8 + MMLU
+
+前提是第 1–3 节已完成，端口 8004 空闲。下面重新设置本节所需的环境变量，不依赖安装时或另一种模型评测时的 shell 状态；无需激活虚拟环境。启动脚本自动完成 MoE 校准，不需要手动准备 profile。
+
+```bash
+export VLLM_ROOT="$HOME/final_test/vllm-aarch64-opt"
+export VLLM_PYTHON="$HOME/final_test/test/bin/python"
+export FUSED_CPP_SRC="$HOME/final_test/fused_cpp/src"
+MMLU_PYTHON="$HOME/final_test/mmlu/.venv/bin/python"
+model_id=dsv4-flash-int8
+run_dir="$HOME/final_test/results/int8-$(date -u +%Y%m%dT%H%M%SZ)"
+
+mkdir -p "$run_dir"
+nohup bash "$VLLM_ROOT/run_numa_4567_w8a8_autocalib.sh" \
+  --served-model-name "$model_id" \
   --enable-tokenizer-info-endpoint --no-enable-prefix-caching \
-  > "$RUN_DIR/server.log" 2>&1 < /dev/null &
-echo $! > "$RUN_DIR/server.pid"
-
-until curl -fsS -o /dev/null http://127.0.0.1:8004/v1/models; do
-  if ! kill -0 "$(cat "$RUN_DIR/server.pid")" 2>/dev/null; then
-    tail -n 60 "$RUN_DIR/server.log"
-    exit 1
-  fi
-  sleep 10
-done
-
-"$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/check_api.py" \
-  --model "$MODEL_ID" --output-dir "$RUN_DIR"
-
-"$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/run_eval.py" \
-  --lm-eval "$MMLU_WORKDIR/.venv/bin/lm-eval" \
-  --harness-dir "$HARNESS_DIR" \
-  --dataset-dir "$DATASET_DIR" \
-  --task-dir "$TASK_DIR" \
-  --model "$MODEL_ID" \
-  --output-dir "$RUN_DIR" \
-  --mode smoke
+  > "$run_dir/server.log" 2>&1 < /dev/null &
+echo $! > "$run_dir/server.pid"
+tail -f "$run_dir/server.log"
 ```
 
-INT8 小样本成功后，按第 6 节的完整评测命令运行 `--mode full`；当前 `MODEL_ID` 和 `RUN_DIR` 已指向 INT8。完成所有评测后，运行 `kill "$(cat "$RUN_DIR/server.pid")"` 停止服务。
+模型加载和权重准备需要数分钟。看到 `Application startup complete` 后按 Ctrl+C 退出日志查看，服务继续运行。检查评分接口：
 
-## 8. `arm-codex-internal` 实测记录
+```bash
+"$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/check_api.py" \
+  --model "$model_id" --output-dir "$run_dir"
+```
 
-2026-09-29 在 `$HOME/final_test` 从空目录安装了 vLLM、AOT fused_cpp、服务虚拟环境和独立 MMLU 环境。vLLM 使用 `549a522c9dca299164ea48c4c7fa533081f7b795`，fused_cpp 使用 `6f8bfbccddf58f0f9d673704ad39c7903ed29c64`。完整 fused_cpp 测试运行 `PYTHONPATH="$FUSED_CPP_SRC:$VLLM_ROOT" "$VLLM_PYTHON" -m pytest -q -rs` 得到 `1577 passed, 4 skipped`；vLLM 专项测试 `tests/models/test_deepseek_v4_cpu_v028.py` 得到 `30 passed`。这组结果包含第 3 节列出的三个内核测试文件。
+成功时打印 `Serving: dsv4-flash-int8; prompt logprobs: 33 tokens`。然后运行 `abstract_algebra` 的两题 smoke：
 
-`check_dataset.py` 验证了 176 个 Parquet 文件，离线加载 `abstract_algebra` 得到 `dev=5`、`test=100`。lm-eval 固定在 `c1c4bea3777f73e188395264083adcf454913344`，数据集固定在 `c30699e8356da336a370243923dbaf21066bb9fe`。
+```bash
+"$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/run_eval.py" \
+  --lm-eval "$HOME/final_test/mmlu/.venv/bin/lm-eval" \
+  --harness-dir "$HOME/final_test/mmlu/lm-evaluation-harness" \
+  --dataset-dir "$HOME/final_test/mmlu/cais-mmlu" \
+  --task-dir "$HOME/final_test/mmlu/tasks/mmlu-local" \
+  --model "$model_id" --output-dir "$run_dir" --mode smoke
+```
 
-| 模型 | 评分接口 | 5-shot 两题小样本 | 结果目录 |
-| --- | --- | --- | --- |
-| BF16 | prompt logprobs 33 tokens | 2/2，结果 JSON 与逐题 JSONL 已保存 | `/home/zhangxu/final_test/results/bf16-20260929T163733Z/` |
-| W8A8 INT8 | prompt logprobs 33 tokens | 2/2，结果 JSON 与逐题 JSONL 已保存 | `/home/zhangxu/final_test/results/int8-20260929T164856Z/` |
+smoke 通过后运行完整 MMLU：
 
-两题结果只证明流程跑通，不能用于比较模型精度。完整 MMLU 尚未运行。两个测试服务已停止，结果文件保留在上述目录。
+```bash
+"$MMLU_PYTHON" "$VLLM_ROOT/scripts/mmlu/run_eval.py" \
+  --lm-eval "$HOME/final_test/mmlu/.venv/bin/lm-eval" \
+  --harness-dir "$HOME/final_test/mmlu/lm-evaluation-harness" \
+  --dataset-dir "$HOME/final_test/mmlu/cais-mmlu" \
+  --task-dir "$HOME/final_test/mmlu/tasks/mmlu-local" \
+  --model "$model_id" --output-dir "$run_dir" --mode full
+```
+
+结果保存在本节的 `run_dir`。评测完成后停止服务；只运行 smoke 时也用这组命令停止：
+
+```bash
+kill "$(cat "$run_dir/server.pid")"
+while kill -0 "$(cat "$run_dir/server.pid")" 2>/dev/null; do sleep 1; done
+```
+
+## 6. 查看结果
+
+结果都保存在本次 `run_dir`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `smoke/<模型名>/results_*.json`、`full/<模型名>/results_*.json` | 汇总和各学科准确率，指标为 `acc,none` |
+| 同目录的 `samples_*.jsonl` | 逐题答案、选项得分和正确性 |
+| `smoke.log`、`full.log` | 评测过程日志 |
+| `server.log`、`server.pid` | 服务日志和进程号 |
+| `models.json`、`tokenizer-info.json`、`completion-smoke.json` | 评分接口检查的原始响应 |
+| `harness.commit`、`dataset.commit` | 本次评测器和数据集版本 |
+
+### 从已保存的文件读取分数
+
+不需要启动服务，也不需要重新发送请求。在新 Bash 会话中执行下面的命令；示例读取机器上已保存的 BF16 smoke 结果：
+
+```bash
+results_dir="$HOME/final_test/results/autocalib-bf16-20260929/smoke/dsv4-flash-bf16"
+"$HOME/final_test/mmlu/.venv/bin/python" - "$results_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+for path in sorted(Path(sys.argv[1]).glob("results_*.json")):
+    data = json.loads(path.read_text())
+    print(f"\n文件：{path}")
+    for task, metrics in data["results"].items():
+        if "acc,none" in metrics:
+            accuracy = metrics["acc,none"]
+            print(f"{task}: {accuracy:.6f} ({accuracy:.2%})")
+PY
+```
+
+示例输出为 `mmlu_abstract_algebra: 1.000000 (100.00%)`，对应这次 smoke 的两题全部答对。JSON 中 `n-samples.mmlu_abstract_algebra.effective` 为 `2`，是实际评测题数。
+
+读取自己的完整测试时，将 `results_dir` 改为本次结果目录下的 `full/dsv4-flash-bf16` 或 `full/dsv4-flash-int8`；读取 INT8 smoke 时使用 `smoke/dsv4-flash-int8`。目录中有多次评测文件时，命令会分别打印文件名和分数。
+
+- `acc,none` 是准确率，`0.75` 表示 `75%`。
+- 完整测试看 `mmlu` 行的汇总分数；`mmlu_abstract_algebra` 等行是各学科分数。
+- smoke 只跑 abstract algebra 的两题，其 `100%` 不能作为完整 MMLU 分数，也不能用于比较 BF16 和 INT8 的精度。
+
+## 实测记录与常见问题
+
+自动校准交付版：vLLM `b7c95b73d4`，fused_cpp `de5a940`。两种模型都使用上面的启动脚本、NUMA 4–7，未传入 planner profile；接口检查和 5-shot 两题 smoke 均通过。完整 MMLU 尚未运行。
+
+| 模型 | 两题 smoke | 已保存的结果目录 |
+| --- | --- | --- |
+| BF16 | 2/2 | `/home/zhangxu/final_test/results/autocalib-bf16-20260929/` |
+| W8A8 INT8 | 2/2 | `/home/zhangxu/final_test/results/autocalib-int8-20260929/` |
+
+| 问题 | 处理 |
+| --- | --- |
+| 服务导入报缺少 `libnvrtc.so.13` | 在服务环境中运行 `uv pip uninstall --python "$VLLM_PYTHON" torchcodec` |
+| 数据检查报告仍是 Git LFS 指针 | 重跑第 3 节的 `download_dataset.py`，再运行 `check_dataset.py` |
+| 导入到旧 vLLM/fused_cpp，或调用了错误的 Python | 核对启动脚本的三个路径；服务用 `test/bin/python`，评测用 `mmlu/.venv/bin/python` |
+| shared MLP 的三个用例因不足 8 核而跳过 | 旧 W8A8 内核会污染调用线程 affinity；更新到 `de5a940` 或之后的提交，并重新安装 fused_cpp |
+
+接手时注意：两题 smoke 只验证流程；BF16/INT8 精度比较需要完整结果和相同数据版本。服务和评测器的上下文长度都是 4096，若完整评测日志出现截断，不能将结果作为未截断的 5-shot 精度使用。
