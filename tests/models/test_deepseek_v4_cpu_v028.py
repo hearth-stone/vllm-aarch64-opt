@@ -1080,3 +1080,149 @@ def test_sparse_candidate_chunks_bound_gathers_and_preserve_query_order(
     assert gathered == list(range(q.shape[0]))
     assert call_sizes == [32, 32, 1]
     torch.testing.assert_close(output.float(), expected.float(), rtol=1e-5, atol=1e-5)
+
+
+class _RowwiseGate(torch.nn.Module):
+    """Router gate whose rows do not depend on the batch (no GEMM blocking)."""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return (x.float()[:, None, :] * self.weight[None]).sum(-1), None
+
+
+def _router_split_moe(gate, router, tp_size: int) -> DeepseekV4MoE:
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    torch.nn.Module.__init__(moe)
+    moe.tp_size = tp_size
+    moe.gate = gate
+    moe.experts = SimpleNamespace(router=router, gate=gate, is_monolithic=False)
+    moe._router_token_split = None
+    return moe
+
+
+@pytest.mark.parametrize("hash_layer", [False, True])
+def test_router_token_split_matches_replicated_routing(monkeypatch, hash_layer):
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        FusedTopKBiasRouter,
+    )
+    from vllm.models.deepseek_v4.cpu import model as cpu_model
+
+    tp_size, tokens, experts, hidden, top_k = 4, 512, 16, 8, 3
+    generator = torch.Generator().manual_seed(41)
+    x = torch.randn(tokens, hidden, generator=generator).to(torch.bfloat16)
+    gate = _RowwiseGate(torch.randn(experts, hidden, generator=generator))
+    bias = torch.randn(experts, generator=generator) * 0.01
+    input_ids = torch.randint(0, 64, (tokens,), generator=generator)
+    table = torch.randint(
+        0, experts, (64, top_k), generator=generator, dtype=torch.int32
+    )
+
+    def make_router():
+        return FusedTopKBiasRouter(
+            top_k=top_k,
+            global_num_experts=experts,
+            e_score_correction_bias=None if hash_layer else bias,
+            renormalize=True,
+            routed_scaling_factor=1.5,
+            scoring_func="sqrtsoftplus",
+            hash_indices_table=table if hash_layer else None,
+        )
+
+    reference = make_router()
+    logits, _ = gate(x)
+    expected = reference._compute_routing(x, logits, torch.int32, input_ids=input_ids)
+
+    monkeypatch.setenv("VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT", "1")
+    # Pass 1 records what each rank sends; pass 2 returns the concatenation.
+    sent: list[torch.Tensor] = []
+    results = []
+    for gathered in (None, "concat"):
+        for rank in range(tp_size):
+            monkeypatch.setattr(
+                cpu_model, "get_tensor_model_parallel_rank", lambda r=rank: r
+            )
+
+            def all_gather(packed, dim, _rank=rank, _mode=gathered):
+                assert dim == 0
+                if _mode is None:
+                    sent.append(packed.clone())
+                    return packed.repeat(tp_size, 1)
+                return torch.cat(sent, dim=0)
+
+            monkeypatch.setattr(
+                cpu_model, "tensor_model_parallel_all_gather", all_gather
+            )
+            router = make_router()
+            moe = _router_split_moe(gate, router, tp_size)
+            moe._maybe_split_router_tokens()
+            assert moe._router_token_split and moe.experts.gate is None
+            out = router._compute_routing(x, x, torch.int32, input_ids=input_ids)
+            if gathered is not None:
+                results.append(out)
+    assert [packed.shape[0] for packed in sent] == [tokens // tp_size] * tp_size
+    for topk_weights, topk_ids in results:
+        assert torch.equal(topk_weights, expected[0])
+        assert torch.equal(topk_ids, expected[1])
+        assert topk_ids.dtype == expected[1].dtype
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_router_token_split_packs_ids_bit_exactly(monkeypatch, ids_dtype):
+    from vllm.models.deepseek_v4.cpu import model as cpu_model
+
+    weights = torch.rand(5, 6)
+    ids = torch.tensor([[0, 255, -1, 7, 2**20, 3]] * 5, dtype=ids_dtype)
+    monkeypatch.setattr(
+        cpu_model,
+        "tensor_model_parallel_all_gather",
+        lambda packed, dim: packed.repeat(2, 1),
+    )
+    gathered_weights, gathered_ids = cpu_model._all_gather_routing(weights, ids)
+    assert torch.equal(gathered_weights, weights.repeat(2, 1))
+    assert torch.equal(gathered_ids, ids.repeat(2, 1))
+    assert gathered_ids.dtype == ids_dtype
+
+
+def test_router_token_split_keeps_small_batches_replicated(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        FusedTopKBiasRouter,
+    )
+    from vllm.models.deepseek_v4.cpu import model as cpu_model
+
+    monkeypatch.setenv("VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT", "1")
+    monkeypatch.setattr(cpu_model, "get_tensor_model_parallel_rank", lambda: 1)
+
+    def no_all_gather(packed, dim):
+        raise AssertionError("small batches must not all-gather")
+
+    monkeypatch.setattr(cpu_model, "tensor_model_parallel_all_gather", no_all_gather)
+    gate = _RowwiseGate(torch.randn(16, 8))
+    router = FusedTopKBiasRouter(
+        top_k=3,
+        global_num_experts=16,
+        e_score_correction_bias=torch.zeros(16),
+        scoring_func="sqrtsoftplus",
+    )
+    moe = _router_split_moe(gate, router, 4)
+    moe._maybe_split_router_tokens()
+    for tokens in (1, 6, 4 * 63, 4 * 64 + 2):
+        x = torch.randn(tokens, 8).to(torch.bfloat16)
+        logits, _ = gate(x)
+        expected = FusedTopKBiasRouter(
+            top_k=3,
+            global_num_experts=16,
+            e_score_correction_bias=torch.zeros(16),
+            scoring_func="sqrtsoftplus",
+        )._compute_routing(x, logits, torch.int32)
+        weights, ids = router._compute_routing(x, x, torch.int32)
+        assert torch.equal(weights, expected[0]) and torch.equal(ids, expected[1])
+
+    monkeypatch.setenv("VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT", "0")
+    disabled = _router_split_moe(
+        gate, FusedTopKBiasRouter(top_k=3, global_num_experts=16), 4
+    )
+    disabled._maybe_split_router_tokens()
+    assert disabled._router_token_split is False and disabled.experts.gate is gate
