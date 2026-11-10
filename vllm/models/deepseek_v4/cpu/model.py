@@ -242,6 +242,11 @@ class DeepseekV4MoE(nn.Module):
         """Reject INT8 shared experts not consumed by the fused MoE backend."""
         if self.shared_experts is None:
             return
+        kernel = getattr(self.experts.routed_experts.quant_method, "moe_kernel", None)
+        experts = getattr(getattr(kernel, "impl", None), "fused_experts", None)
+        # ArmCPUExpertsInt8 keeps shared experts as separate W8A8 linears.
+        if experts is None or not experts.__class__.__name__.startswith("FusedCpp"):
+            return
         projections = (
             self.shared_experts.gate_up_proj,
             self.shared_experts.down_proj,

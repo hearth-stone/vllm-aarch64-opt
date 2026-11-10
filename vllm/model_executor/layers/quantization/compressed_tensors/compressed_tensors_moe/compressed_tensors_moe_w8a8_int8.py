@@ -207,6 +207,10 @@ class CompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor:
         assert self.is_monolithic
         assert self.moe_kernel is not None
+        experts = getattr(getattr(self.moe_kernel, "impl", None), "fused_experts", None)
+        if experts is not None:
+            experts._routing_input_ids = input_ids
+            experts._hash_indices_table = getattr(layer, "_hash_indices_table", None)
         return self.moe_kernel.apply_monolithic(
             x,
             layer.w13_weight,
