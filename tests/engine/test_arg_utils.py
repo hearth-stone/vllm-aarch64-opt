@@ -622,6 +622,30 @@ def test_numa_bind_args():
     assert engine_args.numa_bind_cpus == ["0-3", "4-7", "8-11", "12-15"]
 
 
+def test_numa_bind_node_groups_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--numa-bind",
+            "--numa-bind-node-groups",
+            "0,1",
+            "2,3",
+            "4,5",
+            "6,7",
+            "--numa-bind-cpus",
+            "0-79",
+            "80-159",
+            "160-239",
+            "240-319",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.numa_bind_node_groups == ["0,1", "2,3", "4,5", "6,7"]
+    assert engine_args.numa_bind_cpus == [
+        "0-79", "80-159", "160-239", "240-319"
+    ]
+
+
 def test_ir_op_priority():
     from vllm.config.kernel import IrOpPriorityConfig, KernelConfig
 

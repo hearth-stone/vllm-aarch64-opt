@@ -173,6 +173,22 @@ def get_memory_node_info(node_id: int = 0) -> MemoryNodeInfo:
     )
 
 
+def get_memory_nodes_info(node_ids: list[int]) -> MemoryNodeInfo:
+    """Return the memory available across a worker's bound NUMA nodes."""
+    if not node_ids:
+        raise ValueError("node_ids must not be empty")
+    statuses = [get_memory_node_info(node) for node in node_ids]
+    total_memory = sum(status.total_memory for status in statuses)
+    available_memory = sum(status.available_memory for status in statuses)
+    cgroup_limit, cgroup_usage = get_cgroup_memory_limit()
+    if cgroup_limit is not None:
+        total_memory = min(total_memory, cgroup_limit)
+        available_memory = min(
+            available_memory, max(0, cgroup_limit - (cgroup_usage or 0))
+        )
+    return MemoryNodeInfo(total_memory, available_memory)
+
+
 def get_allowed_cpu_list() -> list[LogicalCPUInfo]:
     cpu_list = _get_cpu_list()
     if sys.platform == "linux":

@@ -18,10 +18,11 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.utils.cpu_resource_utils import (
     get_allowed_cpu_list,
-    get_memory_node_info,
+    get_memory_nodes_info,
     get_visible_memory_node,
 )
 from vllm.utils.mem_utils import format_gib
+from vllm.utils.numa_utils import _get_gpu_index, _get_numa_nodes
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.cpu_model_runner import CPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
@@ -68,9 +69,22 @@ class CPUWorker(Worker):
             )
             memory_node = allowed_memory_nodes[0]
 
-        torch.ops._C.init_cpu_memory_env([memory_node])
+        node_groups = vllm_config.parallel_config.numa_bind_node_groups
+        if node_groups is not None:
+            gpu_index = _get_gpu_index(vllm_config.parallel_config, local_rank)
+            self.memory_nodes = _get_numa_nodes(vllm_config.parallel_config, gpu_index)
+            if any(node not in allowed_memory_nodes for node in self.memory_nodes):
+                raise ValueError(
+                    f"NUMA nodes {self.memory_nodes} are not available to worker "
+                    f"rank {local_rank}: {allowed_memory_nodes}"
+                )
+            # The numactl worker wrapper already installed the requested bind
+            # policy. Reapplying the CPU default here would reduce it to one node.
+        else:
+            self.memory_nodes = [memory_node]
+            torch.ops._C.init_cpu_memory_env(self.memory_nodes)
 
-        memory_status = get_memory_node_info(memory_node)
+        memory_status = get_memory_nodes_info(self.memory_nodes)
         memory_fraction = vllm_config.cache_config.gpu_memory_utilization
         self.requested_cpu_memory = math.ceil(
             memory_status.total_memory * memory_fraction
@@ -82,7 +96,7 @@ class CPUWorker(Worker):
             and self.requested_cpu_memory > available_memory
         ):
             raise ValueError(
-                f"Available memory on node {cpu_core.numa_node} "
+                f"Available memory on nodes {self.memory_nodes} "
                 f"({format_gib(available_memory)}/"
                 f"{format_gib(memory_status.total_memory)} GiB) on startup "
                 f"is less than desired CPU memory utilization "
@@ -200,10 +214,7 @@ class CPUWorker(Worker):
     def determine_available_memory(self) -> int:
         self.model_runner.warming_up_model()
 
-        allowed_cpu_list = get_allowed_cpu_list()
-        cpu_core = allowed_cpu_list[0]
-
-        memory_status = get_memory_node_info(cpu_core.numa_node)
+        memory_status = get_memory_nodes_info(self.memory_nodes)
         available_memory = memory_status.available_memory
         explicit_kv_cache_size = self.cache_config.kv_cache_memory_bytes
 
@@ -212,7 +223,7 @@ class CPUWorker(Worker):
         if explicit_kv_cache_size is not None:
             if explicit_kv_cache_size > available_memory:
                 raise ValueError(
-                    f"Available memory on node {cpu_core.numa_node} "
+                    f"Available memory on nodes {self.memory_nodes} "
                     f"({format_gib(available_memory)}/"
                     f"{format_gib(memory_status.total_memory)} GiB) on kv cache"
                     f" allocation is less than requested memory for kv "
@@ -224,7 +235,7 @@ class CPUWorker(Worker):
             msg = (
                 f"Explicitly set ({format_gib(kv_cache_size)}/"
                 f"{format_gib(memory_status.total_memory)}) GiB for KV cache "
-                f"on node {cpu_core.numa_node}."
+                f"on nodes {self.memory_nodes}."
             )
         else:
             consumed_memory = psutil.Process(os.getpid()).memory_info().rss
@@ -234,7 +245,7 @@ class CPUWorker(Worker):
                 or requested_memory_for_kv > available_memory
             ):
                 raise ValueError(
-                    f"Available memory on node {cpu_core.numa_node} "
+                    f"Available memory on nodes {self.memory_nodes} "
                     f"({format_gib(available_memory)}/"
                     f"{format_gib(memory_status.total_memory)} GiB) on kv cache"
                     f" allocation is less than requested memory for kv "
@@ -246,7 +257,7 @@ class CPUWorker(Worker):
             msg = (
                 f"Auto set ({format_gib(kv_cache_size)}/"
                 f"{format_gib(memory_status.total_memory)}) GiB for KV cache "
-                f"on node {cpu_core.numa_node}, with "
+                f"on nodes {self.memory_nodes}, with "
                 f"{format_gib(self.requested_cpu_memory)} GiB requested memory"
                 f" for the worker. {format_gib(consumed_memory)} GiB"
                 f" memory was consumed by non-kv usages."
