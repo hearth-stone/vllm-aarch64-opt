@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Arm2：TP4，每个 rank 44 核（每个 NUMA 节点 48 核，空出 44-47 等核给 SSP 等后台服务）。
 # 2048 token 输入、1 token 输出实测：W8A8 约 3.5 秒，BF16 约 6.6 秒。
 # SSP 需先限制到空出的核上（重启后失效，需重新执行）：

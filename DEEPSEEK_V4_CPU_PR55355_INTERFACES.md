@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # ARM CPU 实现与 PR #55355 的接口差异
 
 比较日期：2026-09-07。

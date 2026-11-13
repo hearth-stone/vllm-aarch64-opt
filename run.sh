@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 export LD_PRELOAD=/usr/lib64/libjemalloc.so
 export MALLOC_CONF="thp:always,oversize_threshold:2097152,background_thread:true"
 export GLOO_DEVICE_TRANSPORT="TCP"

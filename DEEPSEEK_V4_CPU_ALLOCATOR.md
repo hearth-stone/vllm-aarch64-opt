@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # DeepSeek V4 CPU allocator experiment, 2026-10-10
 
 > Historical experiment: superseded on 2026-10-11 by the hybrid default.

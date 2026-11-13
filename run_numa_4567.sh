@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # DeepSeek-V4-Flash-BF16 on Arm-codex-internal NUMA nodes 4, 5, 6, 7.
 # Each node has 40 CPUs. run.sh retains the 4x80 binding.
 #

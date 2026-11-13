@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 
 curl http://localhost:8004/v1/chat/completions \
   -H "Content-Type: application/json" \

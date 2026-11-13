@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # DeepSeek-V4-Flash-INT8 W8A8 on Arm-codex-internal NUMA nodes 4, 5, 6, 7.
 # Same CPU bind as run_numa_4567.sh. Adds compressed-tensors quantization.
 #

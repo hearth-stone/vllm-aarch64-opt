@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # DeepSeek V4 ARM CPU Torch fallback 审计
 
 审计日期：2026-09-07。基于 `dsv4-arm-cpu-v0.28.0` 的

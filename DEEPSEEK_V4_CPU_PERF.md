@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # 已启动 API 的 CPU 性能测试
 
 在 `arm-codex-internal` 上执行，API 已启动。脚本只使用 Python 标准库，不加载模型。
