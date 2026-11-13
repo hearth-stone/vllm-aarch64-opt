@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.config import ParallelConfig
-from vllm.utils import numa_utils
+from vllm.utils import cpu_resource_utils, numa_utils
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +42,7 @@ def _make_config(**parallel_kwargs):
     parallel_defaults = dict(
         numa_bind=False,
         numa_bind_nodes=None,
+        numa_bind_node_groups=None,
         numa_bind_cpus=None,
         distributed_executor_backend="mp",
         data_parallel_backend="mp",
@@ -73,6 +74,28 @@ def test_get_numactl_args_with_cpu_binding():
     assert (
         numa_utils._get_numactl_worker_args(vllm_config.parallel_config, local_rank=1)
         == "--all --physcpubind=4-7 --membind=1"
+    )
+
+
+def test_get_numactl_args_with_node_groups():
+    vllm_config = _make_config(
+        numa_bind=True,
+        numa_bind_node_groups=["0,1", "2,3", "4,5", "6,7"],
+        numa_bind_cpus=["0-79", "80-159", "160-239", "240-319"],
+        tensor_parallel_size=4,
+    )
+    for rank in range(4):
+        assert numa_utils._get_numactl_worker_args(
+            vllm_config.parallel_config, local_rank=rank
+        ) == (
+            f"--all --physcpubind={rank * 80}-{rank * 80 + 79} "
+            f"--membind={rank * 2},{rank * 2 + 1}"
+        )
+    assert (
+        numa_utils._get_numactl_enginecore_args(
+            vllm_config.parallel_config, local_rank=0
+        )
+        == "--cpunodebind=0,1,2,3,4,5,6,7 --membind=0,1,2,3,4,5,6,7"
     )
 
 
@@ -461,6 +484,37 @@ def test_parallel_config_validates_numa_bind_nodes():
         ParallelConfig(numa_bind_nodes=[0, -1])
 
 
+@pytest.mark.parametrize("group", ["", "0-1", "0,,1", "-1,0", "a,b"])
+def test_parallel_config_rejects_invalid_numa_bind_node_groups(group):
+    with pytest.raises(ValueError, match="numa_bind_node_groups"):
+        ParallelConfig(numa_bind=True, numa_bind_node_groups=[group])
+
+
+def test_parallel_config_rejects_mixed_numa_node_options():
+    with pytest.raises(ValueError, match="exclusive"):
+        ParallelConfig(
+            numa_bind=True,
+            numa_bind_nodes=[0],
+            numa_bind_node_groups=["0,1"],
+        )
+
+
+def test_memory_node_group_uses_pair_capacity_with_one_cgroup_limit(monkeypatch):
+    node_info = {
+        4: cpu_resource_utils.MemoryNodeInfo(100, 80),
+        5: cpu_resource_utils.MemoryNodeInfo(100, 70),
+    }
+    monkeypatch.setattr(
+        cpu_resource_utils, "get_memory_node_info", node_info.__getitem__
+    )
+    monkeypatch.setattr(
+        cpu_resource_utils, "get_cgroup_memory_limit", lambda: (120, 20)
+    )
+    assert cpu_resource_utils.get_memory_nodes_info([4, 5]) == (
+        cpu_resource_utils.MemoryNodeInfo(120, 100)
+    )
+
+
 @pytest.mark.parametrize("cpuset", ["", "abc", "1-", "4-1", "1,,2", "1:2"])
 def test_parallel_config_rejects_invalid_numa_bind_cpus(cpuset):
     with pytest.raises(ValueError, match="numa_bind_cpus"):
@@ -514,3 +568,14 @@ def test_configure_subprocess_numa_fallback(monkeypatch):
     with numa_utils.configure_subprocess(node_config, local_rank=0):
         assert multiprocessing.spawn.get_executable() == before
         assert numa_utils._NUMACTL_ARGS_ENV not in os.environ
+
+
+def test_node_groups_require_memory_binding(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/numactl")
+    monkeypatch.setattr(numa_utils.subprocess, "run", _fake_numactl_run(["--membind="]))
+    config = _make_config(numa_bind=True, numa_bind_node_groups=["0,1"])
+    with (
+        pytest.raises(RuntimeError, match="requires numactl memory binding"),
+        numa_utils.configure_subprocess(config, local_rank=0),
+    ):
+        pass

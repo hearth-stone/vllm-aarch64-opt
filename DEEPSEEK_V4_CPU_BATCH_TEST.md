@@ -77,7 +77,9 @@ MARKER="$HOME/arm-codex-experiment-status.json"
 
 `FUSED_ROOT` 是 SiLU 修复 candidate，对应修复提交 `744855b`。
 `RUNTIME/profiles/rank{tp_rank}.json` 的各 rank 使用 rank0 数值。
-现有 `cpu_allocator_bootstrap` 加载 `RUNTIME/libvllm_cpu_allocator.so`。
+当前默认使用混合分配器：PyTorch 保留内置 mimalloc，普通分配走 jemalloc。
+不再加载 `cpu_allocator_bootstrap` 或独立 allocator 库。以下启动示例已更新为该配置；
+文中历史测试结果仍来自当时的自定义 allocator 部署。
 `OBSERVER` 是本次实验部署的 attention 路径观测副本，记录 C4 post 的请求数、
 token 数、decode token 数和 fused 路径状态；它依赖该机器现有部署。
 
@@ -129,9 +131,10 @@ fi
 export FUSED_CPP_MOE_PLANNER_PROFILE="$RUNTIME/profiles/rank{tp_rank}.json"
 export FUSED_CPP_MOE_HIERARCHICAL_N_SPLIT=0
 export VLLM_CPU_MOE_PREPACK_PREFAULT=1
-export PYTHONPATH="$VLLM_ROOT/scripts/cpu_allocator_bootstrap:$FUSED_ROOT/src:$FUSED_ROOT:$OBSERVER"
+export PYTHONPATH="$FUSED_ROOT/src:$FUSED_ROOT:$OBSERVER:$VLLM_ROOT"
 export LD_LIBRARY_PATH=/usr/local/lib
 export LD_PRELOAD=/usr/local/lib/libomp.so:/usr/lib64/libjemalloc.so
+export MIMALLOC_PURGE_DELAY=-1
 export MALLOC_CONF=background_thread:true,metadata_thp:auto,oversize_threshold:0,dirty_decay_ms:-1,muzzy_decay_ms:-1
 export GLOO_SOCKET_IFNAME=eno1
 export VLLM_TARGET_DEVICE=cpu VLLM_CPU_FUSED_CPP_STRICT=1
@@ -141,10 +144,10 @@ export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=36000
 export VLLM_CUSTOM_SCOPES_FOR_PROFILING=1
 export PREFILL_PATH_LOG_DIR="$run_dir"
 
-nice -n -20 "$PY" -c 'import os, torch; assert os.getpriority(os.PRIO_PROCESS, 0) == -20; assert hasattr(torch.ops._C, "init_cpu_allocator")'
+nice -n -20 "$PY" -c 'import os, torch; assert os.getpriority(os.PRIO_PROCESS, 0) == -20'
 nice -n -20 "$PY" -c 'import vllm.models.deepseek_v4.cpu.attention as a; print(a.__file__); assert "prefill-path-observer-overlay" in a.__file__' \
   > "$run_dir/source-path.txt"
-env | sort | grep -E '^(PYTHONPATH|LD_PRELOAD|LD_LIBRARY_PATH|MALLOC_CONF|GLOO_|VLLM_|FUSED_CPP_)' \
+env | sort | grep -E '^(PYTHONPATH|LD_PRELOAD|LD_LIBRARY_PATH|MIMALLOC_|MALLOC_CONF|GLOO_|VLLM_|FUSED_CPP_)' \
   > "$run_dir/environment.txt"
 git -C "$VLLM_ROOT" rev-parse HEAD > "$run_dir/vllm.commit"
 git -C "$VLLM_ROOT" status --short > "$run_dir/vllm.status"

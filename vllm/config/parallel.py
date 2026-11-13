@@ -295,6 +295,11 @@ class ParallelConfig:
     GPU-to-NUMA topology. The values are passed to `numactl --membind`
     and `--cpunodebind`, so they must be valid `numactl` NUMA node indices.
     """
+    numa_bind_node_groups: list[str] | None = None
+    """NUMA nodes for each worker, as comma-separated groups such as
+    `["0,1", "2,3", "4,5", "6,7"]`. Each worker binds its memory to its
+    group. Cannot be combined with `numa_bind_nodes`.
+    """
     numa_bind_cpus: list[str] | None = None
     """Optional CPU lists to bind each GPU worker to.
 
@@ -422,6 +427,20 @@ class ParallelConfig:
             raise ValueError("numa_bind_nodes must contain non-negative integers.")
         return value
 
+    @field_validator("numa_bind_node_groups")
+    @classmethod
+    def _validate_numa_bind_node_groups(
+        cls, value: list[str] | None
+    ) -> list[str] | None:
+        if value is not None and (
+            not value
+            or any(not re.fullmatch(r"\d+(?:,\d+)*", group) for group in value)
+        ):
+            raise ValueError(
+                "numa_bind_node_groups must contain comma-separated node IDs."
+            )
+        return value
+
     @field_validator("numa_bind_cpus")
     @classmethod
     def _validate_numa_bind_cpus(cls, value: list[str] | None) -> list[str] | None:
@@ -483,12 +502,18 @@ class ParallelConfig:
                 "data_parallel_external_lb can only be set when data_parallel_size > 1"
             )
 
-        if not self.numa_bind and (
-            self.numa_bind_nodes is not None or self.numa_bind_cpus is not None
-        ):
-            raise ValueError(
-                "numa_bind_nodes and numa_bind_cpus require numa_bind=True."
+        if self.numa_bind_nodes is not None and self.numa_bind_node_groups is not None:
+            raise ValueError("numa_bind_nodes and numa_bind_node_groups are exclusive.")
+
+        if not self.numa_bind and any(
+            value is not None
+            for value in (
+                self.numa_bind_nodes,
+                self.numa_bind_node_groups,
+                self.numa_bind_cpus,
             )
+        ):
+            raise ValueError("NUMA binding options require numa_bind=True.")
 
         if self.enable_eplb:
             if not current_platform.is_cuda_alike():
@@ -819,6 +844,7 @@ class ParallelConfig:
             # `_get_numa_node`), which would otherwise diverge the DP hash.
             "numa_bind",
             "numa_bind_nodes",
+            "numa_bind_node_groups",
             "numa_bind_cpus",
             "assigned_physical_gpu_ids",
         }

@@ -476,6 +476,7 @@ class EngineArgs:
     )
     numa_bind: bool = ParallelConfig.numa_bind
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
+    numa_bind_node_groups: list[str] | None = ParallelConfig.numa_bind_node_groups
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     device_ids: list[int | str] | None = None
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
@@ -1030,6 +1031,9 @@ class EngineArgs:
         parallel_group.add_argument("--numa-bind", **parallel_kwargs["numa_bind"])
         parallel_group.add_argument(
             "--numa-bind-nodes", **parallel_kwargs["numa_bind_nodes"]
+        )
+        parallel_group.add_argument(
+            "--numa-bind-node-groups", **parallel_kwargs["numa_bind_node_groups"]
         )
         parallel_group.add_argument(
             "--numa-bind-cpus", **parallel_kwargs["numa_bind_cpus"]
@@ -2283,6 +2287,7 @@ class EngineArgs:
             fault_tolerance_config=self.fault_tolerance_config,
             numa_bind=self.numa_bind,
             numa_bind_nodes=self.numa_bind_nodes,
+            numa_bind_node_groups=self.numa_bind_node_groups,
             numa_bind_cpus=self.numa_bind_cpus,
         )
 

@@ -65,7 +65,10 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         # here would destroy the canonical [N, K] weight/scale layout before
         # the joint prepare hook runs.
         if getattr(layer, "_cpu_fused_cpp_joint_int8_owned", False):
-            self.linear_method = self._raise_unprepared_joint_int8
+            # Prefill uses a packed fused_cpp copy. Decode and the Torch
+            # post path multiply this same [N, K] INT8 tensor, so it must
+            # stay unpacked.
+            self.linear_method = self._apply_weights_unpacked_w8a8
             return
         w_q_name, _, _, _, _ = self.layer_param_names
         weight = getattr(layer, w_q_name)
@@ -91,17 +94,26 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         w_q_name, _, _, _, _ = self.layer_param_names
         return torch.nn.functional.linear(x, getattr(layer, w_q_name), bias)
 
-    def _raise_unprepared_joint_int8(
+    def _apply_weights_unpacked_w8a8(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del layer, x, bias
-        raise RuntimeError(
-            "DeepSeek V4 CPU INT8 projection was not prepared by its "
-            "fused_cpp joint owner"
-        )
+        w_q_name, w_s_name, _, _, _ = self.layer_param_names
+        weight = getattr(layer, w_q_name)
+        scale = getattr(layer, w_s_name).reshape(-1).float()
+        x_shape = x.shape
+        flat = x.reshape(-1, x_shape[-1])
+        amax = flat.abs().amax(dim=1, keepdim=True)
+        act_scale = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+        quantized = (flat / act_scale).round().clamp(-127, 127)
+        output = torch.nn.functional.linear(quantized.float(), weight.float())
+        output = output * act_scale * scale.reshape(1, -1)
+        if bias is not None:
+            output = output + bias.float()
+        output = output.to(dtype=x.dtype)
+        return output.reshape(x_shape[:-1] + (output.shape[-1],))
 
     def process_weights_for_onednn(self, layer: torch.nn.Module) -> None:
         # WEIGHT

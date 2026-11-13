@@ -17,7 +17,9 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -76,6 +78,47 @@ def _configure_cpu_router_gate(gate: GateLinear, *, strict: bool) -> None:
     gate._cpu_fused_cpp_linear_enabled = True
     gate._cpu_fused_cpp_linear_required = strict
     gate._cpu_fused_cpp_out_dtype = torch.float32
+
+
+# Below this many tokens per rank the replicated router is cheaper than the
+# all-gather that a token split needs (decode and small prefills).
+_ROUTER_SPLIT_MIN_ROWS_PER_RANK = 64
+
+
+def _router_split_rows(num_tokens: int, tp_size: int) -> int | None:
+    """Tokens each TP rank routes, or None to route every token on every rank."""
+    if (
+        num_tokens % tp_size != 0
+        or num_tokens // tp_size < _ROUTER_SPLIT_MIN_ROWS_PER_RANK
+    ):
+        return None
+    # The router's padding mask is indexed from token 0; a rank's slice would
+    # read the wrong rows.
+    if (
+        envs.VLLM_MOE_SKIP_PADDING
+        and is_forward_context_available()
+        and get_forward_context().is_padding is not None
+    ):
+        return None
+    return num_tokens // tp_size
+
+
+def _all_gather_routing(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-gather each rank's routed rows along the token dimension.
+
+    The CPU shared-memory all-gather moves floating tensors only, so the ids
+    travel bit-cast to float32 next to the weights: one collective, exact bits.
+    """
+    ids = topk_ids.to(torch.int32) if topk_ids.element_size() < 4 else topk_ids
+    ids_as_float = ids.contiguous().view(torch.float32)
+    packed = torch.cat((topk_weights.to(torch.float32), ids_as_float), dim=1)
+    gathered = tensor_model_parallel_all_gather(packed.contiguous(), dim=0)
+    top_k = topk_weights.shape[1]
+    weights = gathered[:, :top_k].to(topk_weights.dtype)
+    gathered_ids = gathered[:, top_k:].contiguous().view(ids.dtype)
+    return weights, gathered_ids.to(topk_ids.dtype)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -217,6 +260,67 @@ class DeepseekV4MoE(nn.Module):
         # The modular experts adapter needs the owning shared MLP during the
         # post-load routed+shared joint prepack.
         self.experts.routed_experts._dsv4_shared_experts = self.shared_experts
+        # Decided on the first forward, once the quant method is known.
+        self._router_token_split: bool | None = None
+
+    def _maybe_split_router_tokens(self) -> None:
+        """Route each TP rank's share of the tokens and all-gather the top-k.
+
+        Every rank holds the full hidden states and used to run the same router
+        gate GEMM and sqrt-softplus top-k. Instead rank r routes rows
+        [r * M / tp, (r + 1) * M / tp) and one all-gather shares the
+        (weights, ids). Rows are routed independently, so the result is the
+        unsplit routing bit for bit. Monolithic kernels take router logits
+        rather than top-k, so they keep the replicated gate.
+        """
+        if self._router_token_split is not None:
+            return
+        self._router_token_split = False
+        runner = typing.cast(typing.Any, self.experts)
+        router = runner.router
+        if (
+            self.tp_size <= 1
+            or not envs.VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT
+            or runner.gate is not self.gate
+            or getattr(runner, "_fse_fuse_gate", False)
+            or runner.is_monolithic
+            or not hasattr(router, "_compute_routing")
+        ):
+            return
+        compute_routing = router._compute_routing
+        gate = self.gate
+        tp_size = self.tp_size
+        tp_rank = get_tensor_model_parallel_rank()
+
+        def split_compute_routing(
+            hidden_states: torch.Tensor,
+            router_logits: torch.Tensor,
+            indices_type: torch.dtype | None,
+            *,
+            input_ids: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # The runner no longer holds the gate and passes hidden states.
+            del router_logits
+            rows = _router_split_rows(hidden_states.shape[0], tp_size)
+            if rows is None:
+                logits, _ = gate(hidden_states)
+                return compute_routing(
+                    hidden_states, logits, indices_type, input_ids=input_ids
+                )
+            begin, end = tp_rank * rows, (tp_rank + 1) * rows
+            local = hidden_states[begin:end]
+            logits, _ = gate(local)
+            topk_weights, topk_ids = compute_routing(
+                local,
+                logits,
+                indices_type,
+                input_ids=None if input_ids is None else input_ids[begin:end],
+            )
+            return _all_gather_routing(topk_weights, topk_ids)
+
+        router._compute_routing = split_compute_routing
+        runner.gate = None
+        self._router_token_split = True
 
     def disable_placeholder_hash_routing(self) -> bool:
         """Use score routing when a checkpoint ships an empty hash table.
@@ -243,6 +347,11 @@ class DeepseekV4MoE(nn.Module):
         """Reject INT8 shared experts not consumed by the fused MoE backend."""
         if self.shared_experts is None:
             return
+        kernel = getattr(self.experts.routed_experts.quant_method, "moe_kernel", None)
+        experts = getattr(getattr(kernel, "impl", None), "fused_experts", None)
+        # ArmCPUExpertsInt8 keeps shared experts as separate W8A8 linears.
+        if experts is None or not experts.__class__.__name__.startswith("FusedCpp"):
+            return
         projections = (
             self.shared_experts.gate_up_proj,
             self.shared_experts.down_proj,
@@ -265,6 +374,7 @@ class DeepseekV4MoE(nn.Module):
             router = typing.cast(typing.Any, self.experts.router)
             if router._hash_indices_table is not None and input_ids is None:
                 raise ValueError("DeepSeek V4 hash MoE routing requires input_ids")
+            self._maybe_split_router_tokens()
             output = self.experts(
                 hidden_states=hidden_states,
                 router_logits=hidden_states,

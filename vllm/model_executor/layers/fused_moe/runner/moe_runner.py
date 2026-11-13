@@ -585,7 +585,11 @@ class MoERunner(MoERunnerInterface):
         )
 
         if self.routed_experts.quant_method.is_monolithic:
-            # Monolithic kernels: pass router_logits to routed_experts
+            # Monolithic kernels select experts themselves. Keep the hash
+            # table current so DeepSeek V4 hash layers match the router.
+            self.routed_experts._hash_indices_table = getattr(
+                self.router, "_hash_indices_table", None
+            )
             fused_out = self.routed_experts.forward_monolithic(
                 x=hidden_states,
                 router_logits=router_logits,

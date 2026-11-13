@@ -268,6 +268,18 @@ def _get_numa_node(parallel_config, gpu_index: int) -> int:
     return numa_nodes[gpu_index]
 
 
+def _get_numa_nodes(parallel_config, gpu_index: int) -> list[int]:
+    groups = parallel_config.numa_bind_node_groups
+    if groups is None:
+        return [_get_numa_node(parallel_config, gpu_index)]
+    if gpu_index >= len(groups):
+        raise ValueError(
+            f"GPU index {gpu_index} exceeds numa_bind_node_groups size {len(groups)}. "
+            "Ensure the binding lists cover every visible GPU."
+        )
+    return [int(node) for node in groups[gpu_index].split(",")]
+
+
 def _maybe_get_pct_cpu_binding(numa_nodes: list[int]) -> list[int] | None:
     """Return the union of PCT priority cores across ``numa_nodes`` (or None).
 
@@ -348,37 +360,41 @@ def _get_numactl_worker_args(
 ) -> str:
     """Compute the numactl args for a single TP/PP worker subprocess."""
     gpu_index = _get_gpu_index(parallel_config, local_rank, dp_local_rank)
-    numa_node = _get_numa_node(parallel_config, gpu_index)
-    cpu_binding = _get_cpu_binding(parallel_config, gpu_index, [numa_node])
+    numa_nodes = _get_numa_nodes(parallel_config, gpu_index)
+    node_binding = ",".join(str(node) for node in numa_nodes)
+    cpu_binding = _get_cpu_binding(parallel_config, gpu_index, numa_nodes)
 
     if cpu_binding is not None:
         logger.info(
-            "Binding worker subprocess (local_rank=%s, gpu_index=%s) to CPUs %s and NUMA node %s",  # noqa: E501
+            "Binding worker subprocess (local_rank=%s, gpu_index=%s) to CPUs %s and NUMA nodes %s",  # noqa: E501
             local_rank,
             gpu_index,
             cpu_binding,
-            numa_node,
+            node_binding,
         )
-        return f"--all --physcpubind={cpu_binding} --membind={numa_node}"
+        return f"--all --physcpubind={cpu_binding} --membind={node_binding}"
 
     logger.info(
-        "Binding worker subprocess (local_rank=%s, gpu_index=%s) to NUMA node %s",
+        "Binding worker subprocess (local_rank=%s, gpu_index=%s) to NUMA nodes %s",
         local_rank,
         gpu_index,
-        numa_node,
+        node_binding,
     )
-    return f"--all --cpunodebind={numa_node} --membind={numa_node}"
+    return f"--all --cpunodebind={node_binding} --membind={node_binding}"
 
 
 def _get_enginecore_numa_nodes(
     parallel_config, dp_local_rank: int | None = None
 ) -> list[int]:
     """Return the sorted, unique NUMA nodes of the EngineCore's DP shard."""
+    groups = parallel_config.numa_bind_node_groups
     numa_nodes = parallel_config.numa_bind_nodes
-    if numa_nodes is None:
+    if groups is None and numa_nodes is None:
         # Trigger auto-detection (it caches into parallel_config).
         _get_numa_node(parallel_config, 0)
         numa_nodes = parallel_config.numa_bind_nodes
+
+    group_count = len(groups) if groups is not None else len(numa_nodes)
 
     if (
         parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
@@ -395,14 +411,16 @@ def _get_enginecore_numa_nodes(
             * parallel_config.tensor_parallel_size
         )
         shard_start = dp_local_rank * tp_pp_world_size
-        shard_end = min(shard_start + tp_pp_world_size, len(numa_nodes))
+        shard_end = min(shard_start + tp_pp_world_size, group_count)
         shard_indices: range | tuple[int, ...] = range(shard_start, shard_end)
     else:
-        shard_indices = range(len(numa_nodes))
+        shard_indices = range(group_count)
 
     if not shard_indices:
-        return [numa_nodes[0]]
-    return sorted({numa_nodes[i] for i in shard_indices})
+        shard_indices = (0,)
+    return sorted(
+        {node for i in shard_indices for node in _get_numa_nodes(parallel_config, i)}
+    )
 
 
 def _get_numactl_enginecore_args(
@@ -533,6 +551,14 @@ def configure_subprocess(
 
     executable, debug_str = _get_numactl_executable()
     numactl_args = _resolve_numactl_args(numactl_args)
+    if (
+        parallel_config.numa_bind_node_groups is not None
+        and "--membind=" not in numactl_args
+    ):
+        raise RuntimeError(
+            "numa_bind_node_groups requires numactl memory binding, "
+            "but --membind was rejected"
+        )
     if not numactl_args:
         # No NUMA binding possible here; launch without the wrapper.
         yield

@@ -1312,6 +1312,7 @@ class ArmCPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
             RoutingMethodType.Default,
             RoutingMethodType.Renormalize,
             RoutingMethodType.RenormalizeNaive,
+            RoutingMethodType.DeepseekV4,
         ]
 
     @staticmethod
@@ -1343,24 +1344,40 @@ class ArmCPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = select_experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            use_grouped_topk=num_expert_group is not None,
-            top_k=self.moe_config.experts_per_token,
-            renormalize=self.moe_config.routing_method
-            in (
-                RoutingMethodType.Renormalize,
-                RoutingMethodType.RenormalizeNaive,
-            ),
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            scoring_func="softmax",
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
-            ),
-            e_score_correction_bias=e_score_correction_bias,
-        )
+        scale = 1.0 if routed_scaling_factor is None else routed_scaling_factor
+        if self.moe_config.routing_method == RoutingMethodType.DeepseekV4:
+            from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (  # noqa: E501
+                fused_topk_bias,
+            )
+
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                scoring_func="sqrtsoftplus",
+                e_score_correction_bias=e_score_correction_bias,
+                topk=self.moe_config.experts_per_token,
+                renormalize=True,
+                input_tokens=getattr(self, "_routing_input_ids", None),
+                hash_indices_table=getattr(self, "_hash_indices_table", None),
+                routed_scaling_factor=scale,
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                use_grouped_topk=num_expert_group is not None,
+                top_k=self.moe_config.experts_per_token,
+                renormalize=self.moe_config.routing_method
+                in (
+                    RoutingMethodType.Renormalize,
+                    RoutingMethodType.RenormalizeNaive,
+                ),
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                scoring_func="softmax",
+                routed_scaling_factor=scale,
+                e_score_correction_bias=e_score_correction_bias,
+            )
 
         if apply_router_weight_on_input:
             assert topk_ids.size(1) == 1

@@ -1,0 +1,376 @@
+{
+  "schema_version": 2,
+  "kind": "moe_analytic_machine",
+  "machine": {
+    "id": "arm-codex-internal-numa5-40c-sve-jit-quick-v1",
+    "cores_per_rank": 40
+  },
+  "kernel": {
+    "backend_n_tile": 16
+  },
+  "caches": {
+    "l1d_bytes_per_core": 65536,
+    "l2_bytes_per_core": 1310720,
+    "llc_bytes_per_rank": 73400320,
+    "l2_effective_fraction": 0.75,
+    "llc_effective_fraction": 0.6666666666666666,
+    "l2_b_reuse_effective_fraction": 0.75,
+    "l2_b_reuse_miss_floor": 0.0,
+    "l2_b_reuse_miss_at_capacity": 1.0,
+    "l2_b_reuse_miss_ceiling": 1.0
+  },
+  "services": {
+    "dram_bytes": {
+      "single_thread_rate": 34012650426.546432,
+      "saturated_rate": 149999606610.37616,
+      "saturation_threads": 40,
+      "curve": "piecewise_linear",
+      "points": [
+        {
+          "threads": 1,
+          "rate": 34012650426.546432
+        },
+        {
+          "threads": 2,
+          "rate": 48434297703.33978
+        },
+        {
+          "threads": 4,
+          "rate": 48434297703.33978
+        },
+        {
+          "threads": 8,
+          "rate": 91647725907.06972
+        },
+        {
+          "threads": 16,
+          "rate": 137207667600.18503
+        },
+        {
+          "threads": 20,
+          "rate": 137207667600.18503
+        },
+        {
+          "threads": 40,
+          "rate": 149999606610.37616
+        }
+      ]
+    },
+    "gemm_core_flops": {
+      "single_thread_rate": 90496259665.79535,
+      "saturated_rate": 3479024550230.248,
+      "saturation_threads": 40,
+      "curve": "power"
+    },
+    "l1_bytes": {
+      "single_thread_rate": 149157325746.7994,
+      "saturated_rate": 5915802538787.024,
+      "saturation_threads": 40,
+      "curve": "power"
+    },
+    "l2_bytes": {
+      "single_thread_rate": 151336965542.12518,
+      "saturated_rate": 1088087165185.8098,
+      "saturation_threads": 40,
+      "curve": "power"
+    },
+    "llc_bytes": {
+      "single_thread_rate": 46166469020.23843,
+      "saturated_rate": 467270803867.2428,
+      "saturation_threads": 40,
+      "curve": "piecewise_linear",
+      "points": [
+        {
+          "threads": 1,
+          "rate": 46166469020.23843
+        },
+        {
+          "threads": 2,
+          "rate": 60131128148.560394
+        },
+        {
+          "threads": 4,
+          "rate": 60131128148.560394
+        },
+        {
+          "threads": 8,
+          "rate": 119549151114.08531
+        },
+        {
+          "threads": 16,
+          "rate": 227326853810.12698
+        },
+        {
+          "threads": 20,
+          "rate": 285079750467.65155
+        },
+        {
+          "threads": 40,
+          "rate": 467270803867.2428
+        }
+      ]
+    },
+    "matrix_flops": {
+      "single_thread_rate": 92086055470.74664,
+      "saturated_rate": 3679117384297.516,
+      "saturation_threads": 40,
+      "curve": "power"
+    },
+    "frontend_instructions": {
+      "single_thread_rate": 3597111541.8260407,
+      "saturated_rate": 143715522824.12173,
+      "saturation_threads": 40,
+      "curve": "power"
+    }
+  },
+  "overheads": {
+    "call_setup_ns": 0.0,
+    "expert_fixed_ns": 0.0,
+    "route_ns": 0.0,
+    "stage_fixed_ns": 0.0,
+    "range_fixed_ns": 0.0,
+    "panel_range_restart_ns": 13.826086956521738,
+    "w13_panel_range_restart_ns": 13.826086956521738,
+    "w2_panel_range_restart_ns": 13.826086956521738
+  },
+  "planner": {
+    "supported_widths": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      20,
+      32,
+      40
+    ]
+  },
+  "uncertainty": {
+    "relative": 0.2
+  },
+  "stage_scales": {
+    "w13": 1.0,
+    "w2": 1.0
+  },
+  "provenance": {
+    "service_probe_kind": "moe_analytic_service_probe",
+    "service_probe_machine": {
+      "id": "localhost",
+      "architecture": "aarch64",
+      "logical_cpus": 320,
+      "cpu_ids": [
+        200,
+        201,
+        202,
+        203,
+        204,
+        205,
+        206,
+        207,
+        208,
+        209,
+        210,
+        211,
+        212,
+        213,
+        214,
+        215,
+        216,
+        217,
+        218,
+        219,
+        220,
+        221,
+        222,
+        223,
+        224,
+        225,
+        226,
+        227,
+        228,
+        229,
+        230,
+        231,
+        232,
+        233,
+        234,
+        235,
+        236,
+        237,
+        238,
+        239
+      ],
+      "cores_per_rank": 40
+    },
+    "gemm_core_service": "m12_l1_hot_full_no_store",
+    "matrix_service": "register_only_bfmmla_diagnostic",
+    "contention_measurements_used": false,
+    "shared_service_interpolation": {
+      "resources": [
+        "dram_bytes",
+        "llc_bytes"
+      ],
+      "kind": "isotonic_piecewise_linear",
+      "validation": "in_sample_only_until_held_out_widths_are_measured"
+    },
+    "llc_topology_model": "explicit_domains_with_rank_fabric_cap",
+    "topology_source": "service_probe",
+    "panel_range_restart_service": {
+      "w13": "fallback_to_m12_l1_hot_full_no_store_extra_n_range",
+      "w2": "m12_l1_hot_full_no_store_extra_n_range"
+    },
+    "quick_calibration": {
+      "version": 1,
+      "service_widths": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        20,
+        40
+      ],
+      "supported_widths": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        20,
+        32,
+        40
+      ],
+      "seed": 20260814,
+      "operator_residual_training": false
+    }
+  },
+  "topology": {
+    "rank_cpu_ids": [
+      200,
+      201,
+      202,
+      203,
+      204,
+      205,
+      206,
+      207,
+      208,
+      209,
+      210,
+      211,
+      212,
+      213,
+      214,
+      215,
+      216,
+      217,
+      218,
+      219,
+      220,
+      221,
+      222,
+      223,
+      224,
+      225,
+      226,
+      227,
+      228,
+      229,
+      230,
+      231,
+      232,
+      233,
+      234,
+      235,
+      236,
+      237,
+      238,
+      239
+    ],
+    "llc_domains": [
+      {
+        "id": "200-239",
+        "cpu_ids": [
+          200,
+          201,
+          202,
+          203,
+          204,
+          205,
+          206,
+          207,
+          208,
+          209,
+          210,
+          211,
+          212,
+          213,
+          214,
+          215,
+          216,
+          217,
+          218,
+          219,
+          220,
+          221,
+          222,
+          223,
+          224,
+          225,
+          226,
+          227,
+          228,
+          229,
+          230,
+          231,
+          232,
+          233,
+          234,
+          235,
+          236,
+          237,
+          238,
+          239
+        ],
+        "capacity_bytes": 73400320,
+        "service": {
+          "single_thread_rate": 46166469020.23843,
+          "saturated_rate": 467270803867.2428,
+          "saturation_threads": 40,
+          "curve": "piecewise_linear",
+          "points": [
+            {
+              "threads": 1,
+              "rate": 46166469020.23843
+            },
+            {
+              "threads": 2,
+              "rate": 60131128148.560394
+            },
+            {
+              "threads": 4,
+              "rate": 60131128148.560394
+            },
+            {
+              "threads": 8,
+              "rate": 119549151114.08531
+            },
+            {
+              "threads": 16,
+              "rate": 227326853810.12698
+            },
+            {
+              "threads": 20,
+              "rate": 285079750467.65155
+            },
+            {
+              "threads": 40,
+              "rate": 467270803867.2428
+            }
+          ]
+        }
+      }
+    ],
+    "dram_scope": "numa_rank"
+  }
+}

@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_FUSED_CPP_STRICT: bool = False
+    VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT: bool = True
     VLLM_CPU_MOE_PREPACKED_DIR: str | None = None
     VLLM_CPU_MOE_PREPACK_EXPORT_DIR: str | None = None
     VLLM_CPU_MOE_PREPACK_PREFAULT: bool = False
@@ -883,6 +884,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to be available instead of silently selecting an upstream fallback.
     "VLLM_CPU_FUSED_CPP_STRICT": lambda: bool(
         int(os.getenv("VLLM_CPU_FUSED_CPP_STRICT", "0"))
+    ),
+    # (CPU backend, DeepSeek V4, TP > 1) route each rank's share of the prefill
+    # tokens and all-gather the top-k instead of running the replicated router
+    # gate on every rank. Results are identical; 0 restores the replicated gate.
+    "VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT", "1"))
     ),
     "VLLM_CPU_MOE_PREPACKED_DIR": lambda: os.getenv("VLLM_CPU_MOE_PREPACKED_DIR"),
     "VLLM_CPU_MOE_PREPACK_EXPORT_DIR": lambda: os.getenv(

@@ -406,12 +406,11 @@ class DeepseekV4CPUSWAMetadataBuilder(
         # Strict fused prefill consumes seq/gather lengths directly.  Building
         # a [prefill_tokens, window] index matrix here would allocate and fill
         # tens of millions of elements on every request even though the fused
-        # dual-cache gather never reads it.  Keep explicit rows only for
-        # decode; non-strict reference mode retains the full metadata.
+        # dual-cache gather never reads it. Mixed decode/prefill batches use
+        # the row-based attention path, which needs the prefill indices too.
+        skip_prefill_indices = envs.VLLM_CPU_FUSED_CPP_STRICT and not num_decodes
         indexed_tokens = (
-            num_decode_tokens
-            if envs.VLLM_CPU_FUSED_CPP_STRICT
-            else cm.num_actual_tokens
+            num_decode_tokens if skip_prefill_indices else cm.num_actual_tokens
         )
         indices = torch.full(
             (indexed_tokens, self.window_size),
@@ -477,12 +476,12 @@ class DeepseekV4CPUSWAMetadataBuilder(
             decode_swa_lens=lens[:num_decode_tokens],
             prefill_swa_indices=(
                 indices[num_decode_tokens:]
-                if num_prefill_tokens and not envs.VLLM_CPU_FUSED_CPP_STRICT
+                if num_prefill_tokens and not skip_prefill_indices
                 else None
             ),
             prefill_swa_lens=(
                 lens[num_decode_tokens:]
-                if num_prefill_tokens and not envs.VLLM_CPU_FUSED_CPP_STRICT
+                if num_prefill_tokens and not skip_prefill_indices
                 else None
             ),
             num_decodes=num_decodes,

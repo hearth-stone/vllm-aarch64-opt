@@ -3,7 +3,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Focused tests for the v0.28 DeepSeek V4 CPU platform package."""
 
-import importlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,14 +59,22 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 def test_cpu_package_does_not_import_platform_gpu_model_modules():
-    importlib.import_module("vllm.models.deepseek_v4.cpu")
-    forbidden = (
-        "vllm.models.deepseek_v4.nvidia.model",
-        "vllm.models.deepseek_v4.amd.model",
-        "vllm.models.deepseek_v4.xpu.model",
-        "vllm.model_executor.kernels.mhc.tilelang",
-    )
-    assert all(name not in sys.modules for name in forbidden)
+    import subprocess
+
+    code = """
+import importlib
+import sys
+
+importlib.import_module("vllm.models.deepseek_v4.cpu")
+forbidden = (
+    "vllm.models.deepseek_v4.nvidia.model",
+    "vllm.models.deepseek_v4.amd.model",
+    "vllm.models.deepseek_v4.xpu.model",
+    "vllm.model_executor.kernels.mhc.tilelang",
+)
+assert all(name not in sys.modules for name in forbidden)
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_cpu_platform_selects_v4_sparse_mla_backend():
@@ -107,8 +114,20 @@ def test_attention_joint_int8_requires_fused_cpp_even_when_non_strict(
 
 
 def test_int8_shared_experts_require_fused_moe_preparation():
+    class FusedCppExpertsStub:
+        pass
+
     moe = object.__new__(DeepseekV4MoE)
     torch.nn.Module.__init__(moe)
+    moe.experts = SimpleNamespace(
+        routed_experts=SimpleNamespace(
+            quant_method=SimpleNamespace(
+                moe_kernel=SimpleNamespace(
+                    impl=SimpleNamespace(fused_experts=FusedCppExpertsStub())
+                )
+            )
+        )
+    )
     projection = torch.nn.Module()
     projection.register_parameter(
         "weight",
@@ -433,6 +452,65 @@ def test_strict_swa_metadata_skips_unused_prefill_index_matrix(monkeypatch):
     assert metadata.num_decode_tokens == 0
     assert metadata.prefill_swa_indices is None
     assert metadata.prefill_gather_lens.tolist() == [4]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("invalid_last_token", [False, True])
+def test_mixed_swa_metadata_preserves_prefill_rows_for_attention(
+    monkeypatch, strict, invalid_last_token
+):
+    monkeypatch.setenv("VLLM_CPU_FUSED_CPP_STRICT", str(int(strict)))
+    spec = SimpleNamespace(sliding_window=8, block_size=4)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=32),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+    builder = DeepseekV4CPUSWAMetadataBuilder(
+        spec, ["layer"], config, torch.device("cpu")
+    )
+    query_start = torch.tensor([0, 1, 5], dtype=torch.int32)
+    positions = torch.tensor([8, 0, 1, 2, 3], dtype=torch.int64)
+    cm = CommonAttentionMetadata(
+        query_start_loc=query_start,
+        query_start_loc_cpu=query_start,
+        seq_lens=torch.tensor([9, 4], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=5,
+        max_query_len=4,
+        max_seq_len=9,
+        block_table_tensor=torch.tensor([[2, 3, 4], [6, 0, 0]], dtype=torch.int32),
+        slot_mapping=torch.tensor(
+            [16, 24, 25, 26, -1 if invalid_last_token else 27], dtype=torch.int64
+        ),
+        positions=positions,
+    )
+    metadata = builder.build(0, cm)
+    assert metadata.num_decode_tokens == 1
+    assert metadata.num_prefill_tokens == 4
+    torch.testing.assert_close(
+        metadata.decode_swa_indices[0], torch.arange(9, 17, dtype=torch.int32)
+    )
+    assert metadata.prefill_swa_indices is not None
+    assert metadata.prefill_swa_lens is not None
+    expected = torch.full((4, 8), -1, dtype=torch.int32)
+    for index in range(4):
+        if index != 3 or not invalid_last_token:
+            expected[index, : index + 1] = torch.arange(24, 25 + index)
+    torch.testing.assert_close(metadata.prefill_swa_indices, expected)
+    torch.testing.assert_close(
+        metadata.prefill_swa_lens,
+        torch.tensor([1, 2, 3, 0 if invalid_last_token else 4], dtype=torch.int32),
+    )
+    attention = object.__new__(DeepseekV4CPUAttention)
+    torch.nn.Module.__init__(attention)
+    attention.compress_ratio = 1
+    cache = torch.arange(64, dtype=torch.float32).reshape(8, 4, 2)
+    attention.swa_cache_layer = SimpleNamespace(kv_cache=cache)
+    rows = attention._candidate_rows(4, positions, metadata, None, None)
+    expected_rows = cache[6, : 0 if invalid_last_token else 4]
+    torch.testing.assert_close(rows, expected_rows)
 
 
 def test_sparse_mla_reference_includes_sink_denominator():
@@ -922,3 +1000,230 @@ def test_deepseek_v4_cpu_prefix_caching_stays_enabled():
     other_mla = _apply_cpu_prefix_cache_config(other, enable_prefix_caching=True)
     assert other_mla.cache_config.enable_prefix_caching is False
     assert other_mla.scheduler_config.enable_chunked_prefill is False
+
+
+def test_arm_cpu_int8_moe_accepts_deepseek_v4_routing():
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+        ArmCPUExpertsInt8,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kInt8DynamicTokenSym,
+        kInt8StaticChannelSym,
+    )
+
+    assert ArmCPUExpertsInt8._supports_routing_method(
+        RoutingMethodType.DeepseekV4,
+        kInt8StaticChannelSym,
+        kInt8DynamicTokenSym,
+    )
+    assert not ArmCPUExpertsInt8._supports_routing_method(
+        RoutingMethodType.Unspecified,
+        kInt8StaticChannelSym,
+        kInt8DynamicTokenSym,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_fused", [False, True])
+def test_sparse_candidate_chunks_bound_gathers_and_preserve_query_order(
+    dtype: torch.dtype, use_fused: bool
+) -> None:
+    """Long mixed batches retain at most 32 query gathers and keep global slots."""
+    generator = torch.Generator().manual_seed(35)
+    q = torch.randn(65, 2, 8, generator=generator).to(dtype)
+    rows = [
+        torch.randn(1 + token % 5, 8, generator=generator).to(dtype)
+        for token in range(q.shape[0])
+    ]
+    sink = torch.tensor([-0.2, 0.3])
+    scale = 0.5
+    expected = torch.empty_like(q)
+    for token, keys in enumerate(rows):
+        logits = q[token].double() @ keys.double().t() * scale
+        logits = torch.cat((logits, sink.double()[:, None]), dim=-1)
+        probabilities = torch.exp(logits - torch.logsumexp(logits, dim=-1)[:, None])
+        values = torch.cat((keys.double(), torch.zeros(1, 8, dtype=torch.float64)))
+        expected[token] = (probabilities @ values).to(dtype)
+
+    positions = torch.arange(q.shape[0])
+    swa = SimpleNamespace(num_decode_tokens=1)
+    topk = torch.arange(q.shape[0])[:, None]
+    gathered, pending, call_sizes = [], [], []
+
+    def candidate(token, actual_positions, actual_swa, sparse, actual_topk):
+        assert actual_positions is positions and actual_swa is swa
+        assert sparse is None and actual_topk is topk
+        gathered.append(token)
+        pending.append(token)
+        assert len(pending) <= 32
+        return rows[token]
+
+    def fused(query_chunk, key_rows, output_chunk):
+        assert len(key_rows) == len(pending) == query_chunk.shape[0]
+        torch.testing.assert_close(query_chunk, q[pending], rtol=0, atol=0)
+        call_sizes.append(len(key_rows))
+        if use_fused:
+            sparse_mla_reference(query_chunk, key_rows, scale, sink, output_chunk)
+        pending.clear()
+        return use_fused
+
+    layer = SimpleNamespace(
+        _candidate_rows=candidate,
+        _run_fused_sparse=fused,
+        scale=scale,
+        attn_sink=sink,
+    )
+    output = torch.empty_like(q)
+    DeepseekV4CPUAttention._run_sparse_candidates(
+        layer, q, positions, swa, None, topk, output
+    )
+    assert gathered == list(range(q.shape[0]))
+    assert call_sizes == [32, 32, 1]
+    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-5, atol=1e-5)
+
+
+class _RowwiseGate(torch.nn.Module):
+    """Router gate whose rows do not depend on the batch (no GEMM blocking)."""
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return (x.float()[:, None, :] * self.weight[None]).sum(-1), None
+
+
+def _router_split_moe(gate, router, tp_size: int) -> DeepseekV4MoE:
+    moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
+    torch.nn.Module.__init__(moe)
+    moe.tp_size = tp_size
+    moe.gate = gate
+    moe.experts = SimpleNamespace(router=router, gate=gate, is_monolithic=False)
+    moe._router_token_split = None
+    return moe
+
+
+@pytest.mark.parametrize("hash_layer", [False, True])
+def test_router_token_split_matches_replicated_routing(monkeypatch, hash_layer):
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        FusedTopKBiasRouter,
+    )
+    from vllm.models.deepseek_v4.cpu import model as cpu_model
+
+    tp_size, tokens, experts, hidden, top_k = 4, 512, 16, 8, 3
+    generator = torch.Generator().manual_seed(41)
+    x = torch.randn(tokens, hidden, generator=generator).to(torch.bfloat16)
+    gate = _RowwiseGate(torch.randn(experts, hidden, generator=generator))
+    bias = torch.randn(experts, generator=generator) * 0.01
+    input_ids = torch.randint(0, 64, (tokens,), generator=generator)
+    table = torch.randint(
+        0, experts, (64, top_k), generator=generator, dtype=torch.int32
+    )
+
+    def make_router():
+        return FusedTopKBiasRouter(
+            top_k=top_k,
+            global_num_experts=experts,
+            e_score_correction_bias=None if hash_layer else bias,
+            renormalize=True,
+            routed_scaling_factor=1.5,
+            scoring_func="sqrtsoftplus",
+            hash_indices_table=table if hash_layer else None,
+        )
+
+    reference = make_router()
+    logits, _ = gate(x)
+    expected = reference._compute_routing(x, logits, torch.int32, input_ids=input_ids)
+
+    monkeypatch.setenv("VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT", "1")
+    # Pass 1 records what each rank sends; pass 2 returns the concatenation.
+    sent: list[torch.Tensor] = []
+    results = []
+    for gathered in (None, "concat"):
+        for rank in range(tp_size):
+            monkeypatch.setattr(
+                cpu_model, "get_tensor_model_parallel_rank", lambda r=rank: r
+            )
+
+            def all_gather(packed, dim, _rank=rank, _mode=gathered):
+                assert dim == 0
+                if _mode is None:
+                    sent.append(packed.clone())
+                    return packed.repeat(tp_size, 1)
+                return torch.cat(sent, dim=0)
+
+            monkeypatch.setattr(
+                cpu_model, "tensor_model_parallel_all_gather", all_gather
+            )
+            router = make_router()
+            moe = _router_split_moe(gate, router, tp_size)
+            moe._maybe_split_router_tokens()
+            assert moe._router_token_split and moe.experts.gate is None
+            out = router._compute_routing(x, x, torch.int32, input_ids=input_ids)
+            if gathered is not None:
+                results.append(out)
+    assert [packed.shape[0] for packed in sent] == [tokens // tp_size] * tp_size
+    for topk_weights, topk_ids in results:
+        assert torch.equal(topk_weights, expected[0])
+        assert torch.equal(topk_ids, expected[1])
+        assert topk_ids.dtype == expected[1].dtype
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_router_token_split_packs_ids_bit_exactly(monkeypatch, ids_dtype):
+    from vllm.models.deepseek_v4.cpu import model as cpu_model
+
+    weights = torch.rand(5, 6)
+    ids = torch.tensor([[0, 255, -1, 7, 2**20, 3]] * 5, dtype=ids_dtype)
+    monkeypatch.setattr(
+        cpu_model,
+        "tensor_model_parallel_all_gather",
+        lambda packed, dim: packed.repeat(2, 1),
+    )
+    gathered_weights, gathered_ids = cpu_model._all_gather_routing(weights, ids)
+    assert torch.equal(gathered_weights, weights.repeat(2, 1))
+    assert torch.equal(gathered_ids, ids.repeat(2, 1))
+    assert gathered_ids.dtype == ids_dtype
+
+
+def test_router_token_split_keeps_small_batches_replicated(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        FusedTopKBiasRouter,
+    )
+    from vllm.models.deepseek_v4.cpu import model as cpu_model
+
+    monkeypatch.setenv("VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT", "1")
+    monkeypatch.setattr(cpu_model, "get_tensor_model_parallel_rank", lambda: 1)
+
+    def no_all_gather(packed, dim):
+        raise AssertionError("small batches must not all-gather")
+
+    monkeypatch.setattr(cpu_model, "tensor_model_parallel_all_gather", no_all_gather)
+    gate = _RowwiseGate(torch.randn(16, 8))
+    router = FusedTopKBiasRouter(
+        top_k=3,
+        global_num_experts=16,
+        e_score_correction_bias=torch.zeros(16),
+        scoring_func="sqrtsoftplus",
+    )
+    moe = _router_split_moe(gate, router, 4)
+    moe._maybe_split_router_tokens()
+    for tokens in (1, 6, 4 * 63, 4 * 64 + 2):
+        x = torch.randn(tokens, 8).to(torch.bfloat16)
+        logits, _ = gate(x)
+        expected = FusedTopKBiasRouter(
+            top_k=3,
+            global_num_experts=16,
+            e_score_correction_bias=torch.zeros(16),
+            scoring_func="sqrtsoftplus",
+        )._compute_routing(x, logits, torch.int32)
+        weights, ids = router._compute_routing(x, x, torch.int32)
+        assert torch.equal(weights, expected[0]) and torch.equal(ids, expected[1])
+
+    monkeypatch.setenv("VLLM_CPU_DSV4_ROUTER_TOKEN_SPLIT", "0")
+    disabled = _router_split_moe(
+        gate, FusedTopKBiasRouter(top_k=3, global_num_experts=16), 4
+    )
+    disabled._maybe_split_router_tokens()
+    assert disabled._router_token_split is False and disabled.experts.gate is gate

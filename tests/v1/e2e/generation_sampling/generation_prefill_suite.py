@@ -35,14 +35,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument("--max-model-len", type=int, default=2100)
+    parser.add_argument("--max-num-batched-tokens", type=int)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
     parser.add_argument("--numa-bind-cpus")
     parser.add_argument("--numa-bind-nodes")
+    parser.add_argument("--numa-bind-node-groups")
     parser.add_argument("--expected-prompt-tokens", type=int, default=2048)
     parser.add_argument("--min-measured-cases", type=int, default=10)
     parser.add_argument("--request-interval-seconds", type=float, default=0.0)
+    parser.add_argument("--request-cadence-seconds", type=float, default=0.0)
     parser.add_argument(
         "--profile-dir",
         help="Profile all measured requests in one worker trace per TP rank.",
@@ -313,6 +316,7 @@ def main() -> None:
     rank_cpus = split(args.numa_bind_cpus, "|")
     rank_nodes_text = split(args.numa_bind_nodes, ",")
     rank_nodes = [int(node) for node in rank_nodes_text] if rank_nodes_text else None
+    rank_node_groups = split(args.numa_bind_node_groups, "|")
     llm_kwargs: dict[str, object] = {
         "model": args.model,
         "seed": args.seed,
@@ -326,20 +330,26 @@ def main() -> None:
         "block_size": args.block_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
     }
-    if rank_cpus is not None or rank_nodes is not None:
-        if rank_cpus is None or rank_nodes is None:
-            raise ValueError("both NUMA CPU and node lists are required")
+    if rank_cpus is not None or rank_nodes is not None or rank_node_groups is not None:
+        if rank_cpus is None or (rank_nodes is None) == (rank_node_groups is None):
+            raise ValueError("NUMA CPUs require exactly one node binding option")
         if len(rank_cpus) != args.tensor_parallel_size:
             raise ValueError("one NUMA CPU list is required per TP rank")
-        if len(rank_nodes) != args.tensor_parallel_size:
-            raise ValueError("one NUMA node is required per TP rank")
+        selected_nodes = rank_nodes if rank_nodes is not None else rank_node_groups
+        if len(selected_nodes) != args.tensor_parallel_size:
+            raise ValueError("one NUMA node binding is required per TP rank")
         llm_kwargs.update(
             numa_bind=True,
             numa_bind_cpus=rank_cpus,
-            numa_bind_nodes=rank_nodes,
         )
+        if rank_nodes is not None:
+            llm_kwargs["numa_bind_nodes"] = rank_nodes
+        else:
+            llm_kwargs["numa_bind_node_groups"] = rank_node_groups
     if args.kv_cache_memory_bytes is not None:
         llm_kwargs["kv_cache_memory_bytes"] = args.kv_cache_memory_bytes
+    if args.max_num_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.profile_dir:
         llm_kwargs["profiler_config"] = build_profiler_config(args.profile_dir)
 
@@ -387,8 +397,10 @@ def main() -> None:
     )
     warmup_s = (time.perf_counter_ns() - warmup_start) / 1e9
     print(f"warmup case={warmup['case_id']} duration_s={warmup_s:.6f} excluded=true")
-    if args.request_interval_seconds < 0:
-        raise ValueError("--request-interval-seconds must be non-negative")
+    if args.request_interval_seconds < 0 or args.request_cadence_seconds < 0:
+        raise ValueError("request interval and cadence must be non-negative")
+    if args.request_interval_seconds and args.request_cadence_seconds:
+        raise ValueError("request interval and cadence are mutually exclusive")
 
     if args.repeat_measured_case_index is not None:
         if not 0 <= args.repeat_measured_case_index < len(cases):
@@ -414,6 +426,8 @@ def main() -> None:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     durations = []
+    request_starts_ns: list[int] = []
+    previous_start_ns = warmup_start
     route_manifest_rows: list[dict[str, object]] = []
     if warmup_route_path is not None:
         route_manifest_rows.append(
@@ -444,7 +458,14 @@ def main() -> None:
     try:
         with output.open("w", encoding="utf-8") as f:
             for index, (source_case_index, case) in enumerate(measurement_cases):
-                if args.request_interval_seconds:
+                if args.request_cadence_seconds:
+                    deadline_ns = previous_start_ns + round(
+                        args.request_cadence_seconds * 1e9
+                    )
+                    delay_s = (deadline_ns - time.perf_counter_ns()) / 1e9
+                    if delay_s > 0:
+                        time.sleep(delay_s)
+                elif args.request_interval_seconds:
                     time.sleep(args.request_interval_seconds)
                 frequency_samples: list[list[float]] = []
                 frequency_stop = threading.Event()
@@ -462,6 +483,8 @@ def main() -> None:
                     )
                     frequency_thread.start()
                 start_ns = time.perf_counter_ns()
+                previous_start_ns = start_ns
+                request_starts_ns.append(start_ns)
                 outputs, route_path = run_with_route_capture(
                     llm,
                     TokensPrompt(prompt_token_ids=case["prompt_token_ids"]),
@@ -491,6 +514,7 @@ def main() -> None:
                     "generated_token_ids": generated_token_ids,
                     "generated_text": completion.text,
                     "duration_s": duration_s,
+                    "request_start_ns": start_ns,
                     "input_tokens_per_s": len(case["prompt_token_ids"]) / duration_s,
                 }
                 if route_path is not None:
@@ -568,6 +592,13 @@ def main() -> None:
         "warmup_duration_s": warmup_s,
         "warmup_excluded": True,
         "request_interval_seconds": args.request_interval_seconds,
+        "request_cadence_seconds": args.request_cadence_seconds,
+        "observed_request_start_intervals_s": [
+            (later - earlier) / 1e9
+            for earlier, later in zip(
+                request_starts_ns, request_starts_ns[1:], strict=False
+            )
+        ],
         "profile_dir": os.path.abspath(args.profile_dir) if args.profile_dir else None,
         "route_capture_dir": str(route_dir) if route_dir is not None else None,
         "route_capture_summary": route_summary,

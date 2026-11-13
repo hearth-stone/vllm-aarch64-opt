@@ -195,6 +195,7 @@ def _runtime_for(layer: torch.nn.Module, moe: Any) -> Any:
             concurrent_ranks=1,
             cpu_ids=cpu_ids,
             shared_experts=1,
+            cost_cache_dir=None,
         )
         moe.set_default_moe_planner_runtime(_RUNTIME)
         if moe.get_default_moe_planner_runtime() is not _RUNTIME:
