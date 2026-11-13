@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # DeepSeek V4：100 条中文 2K 输入及串行性能测试
 
 `zh2048-public-100.jsonl` 是机器上原有的 100 条中文输入，原样纳入仓库。

@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # DeepSeek V4 Flash CPU MMLU 评测
 
 本文从空目录克隆 vLLM 与 AOT fused_cpp，安装服务环境和独立的 MMLU 环境，再通过 vLLM Completions 服务运行 5-shot MMLU。命令面向 `arm-codex-internal` 的 Linux AArch64、NUMA 4–7，默认在同一个 Bash shell 中依次执行。BF16 和 W8A8 INT8 分开启动，结果分别保存。

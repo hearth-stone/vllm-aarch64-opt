@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # Arm-codex TP4 MoE 固定校准表
 
 这四份 JSON 是 Arm-codex-internal 上已经用于 Flash BF16、Flash INT8 和 Pro

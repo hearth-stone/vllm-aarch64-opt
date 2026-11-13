@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # TP4，每个 rank 80 核，使用 LLVM OpenMP，PyTorch 保留 mimalloc，普通分配使用 jemalloc。
 set -euo pipefail
 

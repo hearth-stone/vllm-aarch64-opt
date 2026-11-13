@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # DeepSeek V4 Flash W8A8 INT8 precision run: TP4, one 40-core NUMA node per rank.
 set -euo pipefail
 

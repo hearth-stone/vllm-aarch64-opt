@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # DeepSeek V4 CPU 单请求、Batch 与持续压力测试
 
 这套脚本在 `Arm-codex-internal` 的现有环境中，通过 vLLM Completions HTTP

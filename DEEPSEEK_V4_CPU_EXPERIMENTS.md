@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 Huawei Technologies Co., Ltd. -->
+
 # DeepSeek V4 CPU 实验运行说明
 
 本文记录 `dsv4-arm-cpu-v0.28.0` 在 `Arm-codex-internal` 上的可复现实验方法。
